@@ -3,7 +3,7 @@ import os
 import os.path
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 import requests
@@ -11,7 +11,7 @@ import requests
 import audio
 
 # Configuration via environment variables with sensible defaults
-_DEFAULT_BRIDGE_STORE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "whatsapp-bridge", "store")
+_DEFAULT_BRIDGE_STORE_DIR = os.path.expanduser("~/.local/share/whatsapp-mcp/data/store")
 MESSAGES_DB_PATH = os.getenv(
     "WHATSAPP_DB_PATH",
     os.path.join(_DEFAULT_BRIDGE_STORE_DIR, "messages.db"),
@@ -1304,3 +1304,446 @@ def download_media(message_id: str, chat_jid: str) -> str | None:
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         return None
+
+
+def parse_timeframe(timeframe: str | None) -> tuple[str | None, str | None]:
+    """Parse natural or ISO timeframes into (after, before) ISO strings."""
+    if not timeframe:
+        return None, None
+    tf = timeframe.strip().lower()
+    now = datetime.now().astimezone()
+    if tf == "today":
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return start.isoformat(), None
+    elif tf == "yesterday":
+        start = (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        end = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return start.isoformat(), end.isoformat()
+    elif tf in ("last_24_hours", "24h"):
+        start = now - timedelta(hours=24)
+        return start.isoformat(), None
+    elif tf in ("last_3_days", "3d"):
+        start = now - timedelta(days=3)
+        return start.isoformat(), None
+    elif tf == "this_week":
+        start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+        return start.isoformat(), None
+    elif tf in ("last_7_days", "7d", "last_week"):
+        start = now - timedelta(days=7)
+        return start.isoformat(), None
+    elif tf in ("last_30_days", "30d", "this_month"):
+        start = now - timedelta(days=30)
+        return start.isoformat(), None
+    elif tf in ("last_6_months", "6m"):
+        start = now - timedelta(days=180)
+        return start.isoformat(), None
+    elif tf in ("last_year", "1y"):
+        start = now - timedelta(days=365)
+        return start.isoformat(), None
+    try:
+        dt = datetime.fromisoformat(timeframe)
+        return dt.isoformat(), None
+    except ValueError:
+        return None, None
+
+
+def search_messages(
+    query: str,
+    chat_jid: str | None = None,
+    sender_phone_number: str | None = None,
+    after: str | None = None,
+    before: str | None = None,
+    timeframe: str | None = None,
+    limit: int = 20,
+    page: int = 0,
+) -> list[dict[str, Any]]:
+    """Search messages using SQLite FTS5 full-text index across conversations.
+
+    Supports phrase search (\"termo exato\"), boolean operators (AND, OR, NOT), wildcards (prefix*),
+    and falls back cleanly to substring search if special FTS syntax is malformed.
+    """
+    if timeframe:
+        tf_after, tf_before = parse_timeframe(timeframe)
+        after = after or tf_after
+        before = before or tf_before
+
+    conn = sqlite3.connect(MESSAGES_DB_PATH)
+    cursor = conn.cursor()
+    offset = page * limit
+
+    fts_sql = """
+        SELECT 
+            m.timestamp, 
+            m.sender, 
+            chats.name, 
+            m.content, 
+            m.is_from_me, 
+            chats.jid, 
+            m.id, 
+            m.media_type, 
+            m.quoted_message_id, 
+            m.filename,
+            snippet(messages_fts, 0, '«', '»', '...', 15) AS match_snippet
+        FROM messages_fts f
+        JOIN messages m ON m.rowid = f.rowid
+        JOIN chats ON m.chat_jid = chats.jid
+        WHERE messages_fts MATCH ?
+    """
+    where_extra = []
+    params: list[Any] = [query]
+
+    if chat_jid:
+        where_extra.append("m.chat_jid = ?")
+        params.append(chat_jid)
+
+    if sender_phone_number:
+        aliases = _sender_aliases(sender_phone_number)
+        placeholders = ",".join("?" * len(aliases))
+        where_extra.append(f"m.sender IN ({placeholders})")
+        params.extend(aliases)
+
+    if after:
+        where_extra.append("m.timestamp >= ?")
+        params.append(after)
+
+    if before:
+        where_extra.append("m.timestamp <= ?")
+        params.append(before)
+
+    if where_extra:
+        fts_sql += " AND " + " AND ".join(where_extra)
+
+    fts_sql += " ORDER BY m.timestamp DESC LIMIT ? OFFSET ?"
+    params.extend([limit, offset])
+
+    try:
+        cursor.execute(fts_sql, tuple(params))
+        rows = cursor.fetchall()
+    except sqlite3.OperationalError:
+        # Fallback to substring matching if FTS syntax is invalid
+        fallback_sql = """
+            SELECT 
+                m.timestamp, 
+                m.sender, 
+                chats.name, 
+                m.content, 
+                m.is_from_me, 
+                chats.jid, 
+                m.id, 
+                m.media_type, 
+                m.quoted_message_id, 
+                m.filename,
+                m.content AS match_snippet
+            FROM messages m
+            JOIN chats ON m.chat_jid = chats.jid
+            WHERE (instr(LOWER(m.content), LOWER(?)) > 0 OR instr(m.content, ?) > 0)
+        """
+        fallback_params: list[Any] = [query, query]
+        fb_where = []
+        if chat_jid:
+            fb_where.append("m.chat_jid = ?")
+            fallback_params.append(chat_jid)
+        if sender_phone_number:
+            aliases = _sender_aliases(sender_phone_number)
+            placeholders = ",".join("?" * len(aliases))
+            fb_where.append(f"m.sender IN ({placeholders})")
+            fallback_params.extend(aliases)
+        if after:
+            fb_where.append("m.timestamp >= ?")
+            fallback_params.append(after)
+        if before:
+            fb_where.append("m.timestamp <= ?")
+            fallback_params.append(before)
+        if fb_where:
+            fallback_sql += " AND " + " AND ".join(fb_where)
+        fallback_sql += " ORDER BY m.timestamp DESC LIMIT ? OFFSET ?"
+        fallback_params.extend([limit, offset])
+
+        cursor.execute(fallback_sql, tuple(fallback_params))
+        rows = cursor.fetchall()
+
+    results = []
+    for r in rows:
+        results.append({
+            "id": r[6],
+            "timestamp": r[0],
+            "chat_jid": r[5],
+            "chat_name": r[2] or r[5],
+            "sender": r[1],
+            "sender_name": get_sender_name(r[1]) if r[1] else None,
+            "is_from_me": bool(r[4]),
+            "content": r[3],
+            "match_snippet": r[10],
+            "media_type": r[7] if r[7] else None,
+            "quoted_message_id": r[8] if r[8] else None,
+        })
+    return results
+
+
+def catch_up(
+    timeframe: str = "today",
+    only_groups: bool = False,
+    limit_chats: int = 10,
+) -> dict[str, Any]:
+    """Generate an activity digest and catch-up summary of recent WhatsApp activity.
+
+    Includes message counts, most active chats with previews, questions directed at the user,
+    and media summaries.
+    """
+    after, before = parse_timeframe(timeframe)
+    if not after:
+        after, _ = parse_timeframe("today")
+
+    conn = sqlite3.connect(MESSAGES_DB_PATH)
+    cursor = conn.cursor()
+
+    where_clauses = ["m.timestamp >= ?"]
+    params: list[Any] = [after]
+    if before:
+        where_clauses.append("m.timestamp <= ?")
+        params.append(before)
+    if only_groups:
+        where_clauses.append("c.jid LIKE '%@g.us'")
+
+    where_str = " AND ".join(where_clauses)
+
+    cursor.execute(f"SELECT COUNT(*) FROM messages m JOIN chats c ON m.chat_jid = c.jid WHERE {where_str}", tuple(params))
+    total_messages = cursor.fetchone()[0]
+
+    active_chats_sql = f"""
+        SELECT 
+            c.jid, 
+            c.name, 
+            COUNT(m.id) AS msg_count, 
+            MAX(m.timestamp) AS last_activity
+        FROM messages m
+        JOIN chats c ON m.chat_jid = c.jid
+        WHERE {where_str}
+        GROUP BY c.jid
+        ORDER BY msg_count DESC
+        LIMIT ?
+    """
+    cursor.execute(active_chats_sql, tuple(params + [limit_chats]))
+    active_chats_rows = cursor.fetchall()
+
+    active_chats = []
+    for row in active_chats_rows:
+        chat_jid, chat_name, count, last_act = row
+        cursor.execute(
+            """
+            SELECT sender, content, timestamp, is_from_me, media_type
+            FROM messages
+            WHERE chat_jid = ? AND timestamp >= ?
+            ORDER BY timestamp DESC
+            LIMIT 3
+            """,
+            (chat_jid, after),
+        )
+        recent = [
+            {
+                "sender": r[0],
+                "sender_name": get_sender_name(r[0]) if r[0] else None,
+                "content": r[1],
+                "timestamp": r[2],
+                "is_from_me": bool(r[3]),
+                "media_type": r[4] or None,
+            }
+            for r in cursor.fetchall()
+        ]
+        active_chats.append({
+            "jid": chat_jid,
+            "name": chat_name or chat_jid,
+            "is_group": chat_jid.endswith("@g.us"),
+            "message_count": count,
+            "last_activity": last_act,
+            "recent_messages": recent,
+        })
+
+    q_params = list(params)
+    cursor.execute(
+        f"""
+        SELECT m.timestamp, m.sender, c.name, m.content, c.jid, m.id
+        FROM messages m
+        JOIN chats c ON m.chat_jid = c.jid
+        WHERE {where_str}
+          AND m.is_from_me = 0
+          AND (m.content LIKE '%?' OR m.content LIKE '%? %')
+        ORDER BY m.timestamp DESC
+        LIMIT 10
+        """,
+        tuple(q_params),
+    )
+    questions = [
+        {
+            "id": r[5],
+            "timestamp": r[0],
+            "sender": r[1],
+            "sender_name": get_sender_name(r[1]) if r[1] else None,
+            "chat_name": r[2] or r[4],
+            "chat_jid": r[4],
+            "question": r[3],
+        }
+        for r in cursor.fetchall()
+    ]
+
+    cursor.execute(
+        f"""
+        SELECT media_type, COUNT(*)
+        FROM messages m
+        JOIN chats c ON m.chat_jid = c.jid
+        WHERE {where_str} AND m.media_type != ''
+        GROUP BY media_type
+        """,
+        tuple(params),
+    )
+    media_summary = {r[0]: r[1] for r in cursor.fetchall()}
+
+    summary_text = f"Activity in '{timeframe}': {total_messages} messages across {len(active_chats)} top chats."
+    if questions:
+        summary_text += f" Found {len(questions)} questions directed at you."
+    if media_summary:
+        media_parts = [f"{count} {mtype}(s)" for mtype, count in media_summary.items()]
+        summary_text += f" Media received: {', '.join(media_parts)}."
+
+    return {
+        "timeframe": timeframe,
+        "after": after,
+        "before": before,
+        "total_messages": total_messages,
+        "summary": summary_text,
+        "active_chats": active_chats,
+        "questions_for_you": questions,
+        "media_summary": media_summary,
+    }
+
+
+def list_unread_chats(only_groups: bool = False, limit: int = 30) -> list[dict[str, Any]]:
+    """List chats that have unread incoming messages."""
+    conn = sqlite3.connect(MESSAGES_DB_PATH)
+    cursor = conn.cursor()
+
+    group_clause = "AND c.jid LIKE '%@g.us'" if only_groups else ""
+    query = f"""
+        SELECT 
+            c.jid, 
+            c.name, 
+            COUNT(m.id) AS unread_count, 
+            MAX(m.timestamp) AS last_message_time,
+            c.last_read_time
+        FROM messages m
+        JOIN chats c ON m.chat_jid = c.jid
+        WHERE m.is_from_me = 0 
+          AND (c.last_read_time IS NULL OR m.timestamp > c.last_read_time)
+          {group_clause}
+        GROUP BY c.jid
+        ORDER BY unread_count DESC
+        LIMIT ?
+    """
+    cursor.execute(query, (limit,))
+    rows = cursor.fetchall()
+
+    results = []
+    for r in rows:
+        chat_jid, chat_name, unread_count, last_time, last_read = r
+        cursor.execute(
+            """
+            SELECT sender, content, timestamp, media_type
+            FROM messages
+            WHERE chat_jid = ? AND is_from_me = 0
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            (chat_jid,),
+        )
+        last_msg = cursor.fetchone()
+        last_preview = None
+        if last_msg:
+            last_preview = {
+                "sender": last_msg[0],
+                "sender_name": get_sender_name(last_msg[0]) if last_msg[0] else None,
+                "content": last_msg[1],
+                "timestamp": last_msg[2],
+                "media_type": last_msg[3] or None,
+            }
+
+        results.append({
+            "jid": chat_jid,
+            "name": chat_name or chat_jid,
+            "is_group": chat_jid.endswith("@g.us"),
+            "unread_count": unread_count,
+            "last_message_time": last_time,
+            "last_read_time": last_read,
+            "latest_incoming_message": last_preview,
+        })
+    return results
+
+
+def extract_action_items(
+    chat_jid: str | None = None,
+    timeframe: str = "last_7_days",
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """Extract action items, asks, commitments, and deadlines from recent conversations."""
+    after, before = parse_timeframe(timeframe)
+    if not after:
+        after, _ = parse_timeframe("last_7_days")
+
+    conn = sqlite3.connect(MESSAGES_DB_PATH)
+    cursor = conn.cursor()
+
+    where_clauses = ["m.timestamp >= ?"]
+    params: list[Any] = [after]
+    if before:
+        where_clauses.append("m.timestamp <= ?")
+        params.append(before)
+    if chat_jid:
+        where_clauses.append("m.chat_jid = ?")
+        params.append(chat_jid)
+
+    keywords = [
+        "preciso", "favor", "pode enviar", "pode fazer", "pode me", "me envia", "me passa",
+        "combinado", "reunião", "reuniao", "até amanhã", "ate amanha", "segunda", "sexta",
+        "assinar", "enviar", "aprovar", "template", "link", "aguardo", "urgente", "deadline",
+        "please", "can you", "let's schedule", "todo", "action item"
+    ]
+    like_clauses = " OR ".join(["LOWER(m.content) LIKE ?" for _ in keywords])
+    where_clauses.append(f"({like_clauses} OR m.content LIKE '%?')")
+    params.extend([f"%{kw}%" for kw in keywords])
+
+    where_str = " AND ".join(where_clauses)
+    sql = f"""
+        SELECT 
+            m.id, 
+            m.timestamp, 
+            m.sender, 
+            c.name, 
+            c.jid, 
+            m.content, 
+            m.is_from_me
+        FROM messages m
+        JOIN chats c ON m.chat_jid = c.jid
+        WHERE {where_str}
+        ORDER BY m.timestamp DESC
+        LIMIT ?
+    """
+    params.append(limit)
+    cursor.execute(sql, tuple(params))
+    rows = cursor.fetchall()
+
+    action_items = []
+    for r in rows:
+        msg_id, ts, sender, c_name, c_jid, content, is_from_me = r
+        item_type = "question" if content.strip().endswith("?") else "action_or_commitment"
+        action_items.append({
+            "message_id": msg_id,
+            "timestamp": ts,
+            "chat_jid": c_jid,
+            "chat_name": c_name or c_jid,
+            "sender": sender,
+            "sender_name": get_sender_name(sender) if sender else None,
+            "is_from_me": bool(is_from_me),
+            "type": item_type,
+            "content": content,
+        })
+    return action_items
+

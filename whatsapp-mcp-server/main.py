@@ -60,6 +60,12 @@ from whatsapp import (
 from whatsapp import (
     send_reaction as whatsapp_send_reaction,
 )
+from whatsapp import (
+    catch_up as whatsapp_catch_up,
+    extract_action_items as whatsapp_extract_action_items,
+    list_unread_chats as whatsapp_list_unread_chats,
+    search_messages as whatsapp_search_messages,
+)
 
 # Initialize FastMCP server. Env-var handling is deferred to the __main__ block
 # so importing this module never parses env vars or exits the process.
@@ -338,6 +344,74 @@ def get_message_context(message_id: str, before: int = 5, after: int = 5) -> dic
         "before": [msg_to_dict(message) for message in context.before],
         "after": [msg_to_dict(message) for message in context.after],
     }
+
+
+@mcp.tool()
+def search_messages(
+    query: Annotated[str, Field(description="Search query across all messages. Supports exact phrases in quotes, boolean AND/OR/NOT, and prefix wildcards (e.g. 'termo*')")],
+    chat_jid: Annotated[str | None, Field(description="Optional chat JID to filter messages to a specific conversation")] = None,
+    sender_phone_number: Annotated[str | None, Field(description="Optional phone number to filter messages by sender")] = None,
+    after: Annotated[str | None, Field(description="Optional ISO timestamp to filter messages after this date")] = None,
+    before: Annotated[str | None, Field(description="Optional ISO timestamp to filter messages before this date")] = None,
+    timeframe: Annotated[str | None, Field(description="Optional natural timeframe preset: 'today', 'yesterday', 'last_24_hours', 'last_3_days', 'this_week', 'last_7_days', 'last_30_days', 'last_6_months'")] = None,
+    limit: Annotated[int, Field(description="Maximum number of messages to return (default 20)")] = 20,
+    page: Annotated[int, Field(description="Page number for pagination (default 0)")] = 0,
+) -> list[dict[str, Any]]:
+    """Search messages across all conversations using high-performance SQLite FTS5 full-text indexing."""
+    return whatsapp_search_messages(
+        query=query,
+        chat_jid=chat_jid,
+        sender_phone_number=sender_phone_number,
+        after=after,
+        before=before,
+        timeframe=timeframe,
+        limit=limit,
+        page=page,
+    )
+
+
+@mcp.tool()
+def catch_up(
+    timeframe: Annotated[str, Field(description="Timeframe for the activity digest: 'today', 'yesterday', 'last_24_hours', 'last_3_days', 'this_week', 'last_7_days', 'last_30_days'")] = "today",
+    only_groups: Annotated[bool, Field(description="Whether to only include group chats in the digest")] = False,
+    limit_chats: Annotated[int, Field(description="Maximum number of active chats to highlight (default 10)")] = 10,
+) -> dict[str, Any]:
+    """Provide an intelligent activity digest and catch-up summary of recent WhatsApp activity.
+
+    Includes total message counts, most active chats with recent message previews,
+    unanswered questions directed at the user, and a breakdown of media received.
+    """
+    return whatsapp_catch_up(
+        timeframe=timeframe,
+        only_groups=only_groups,
+        limit_chats=limit_chats,
+    )
+
+
+@mcp.tool()
+def list_unread_chats(
+    only_groups: Annotated[bool, Field(description="Whether to only list unread group chats")] = False,
+    limit: Annotated[int, Field(description="Maximum number of unread chats to return (default 30)")] = 30,
+) -> list[dict[str, Any]]:
+    """List conversations that have unread incoming messages, sorted by unread count."""
+    return whatsapp_list_unread_chats(
+        only_groups=only_groups,
+        limit=limit,
+    )
+
+
+@mcp.tool()
+def extract_action_items(
+    chat_jid: Annotated[str | None, Field(description="Optional chat JID to filter messages to a specific conversation")] = None,
+    timeframe: Annotated[str, Field(description="Timeframe to scan: 'today', 'last_3_days', 'this_week', 'last_7_days', 'last_30_days'")] = "last_7_days",
+    limit: Annotated[int, Field(description="Maximum number of action items to extract (default 20)")] = 20,
+) -> list[dict[str, Any]]:
+    """Extract action items, asks, commitments, and deadlines from recent conversations."""
+    return whatsapp_extract_action_items(
+        chat_jid=chat_jid,
+        timeframe=timeframe,
+        limit=limit,
+    )
 
 
 @read_only_tool()
