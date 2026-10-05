@@ -301,6 +301,29 @@ func ensureMessageStoreSchema(db *sql.DB) error {
 	if err := ensureColumn(db, "messages", "quoted_message_id", "TEXT"); err != nil {
 		return fmt.Errorf("failed to ensure messages.quoted_message_id column: %w", err)
 	}
+
+	// Ensure SQLite FTS5 virtual table and synchronization triggers exist
+	_, err := db.Exec(`
+		CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+			content,
+			content='messages',
+			content_rowid='rowid'
+		);
+		CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
+			INSERT INTO messages_fts(rowid, content) VALUES (new.rowid, new.content);
+		END;
+		CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
+			INSERT INTO messages_fts(messages_fts, rowid) VALUES ('delete', old.rowid);
+		END;
+		CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
+			INSERT INTO messages_fts(messages_fts, rowid) VALUES ('delete', old.rowid);
+			INSERT INTO messages_fts(rowid, content) VALUES (new.rowid, new.content);
+		END;
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to ensure messages_fts virtual table and triggers: %w", err)
+	}
+
 	return nil
 }
 
