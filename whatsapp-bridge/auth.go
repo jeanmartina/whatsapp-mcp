@@ -96,7 +96,7 @@ func printTokenBanner(token string, port int) {
 	fmt.Println("════════════════════════════════════════════════════════════════════")
 	fmt.Println("  WHATSAPP BRIDGE AUTH TOKEN — first-time setup")
 	fmt.Println("════════════════════════════════════════════════════════════════════")
-	fmt.Printf("  Token:          %s\n", token)
+	fmt.Printf("  Token:          [REDACTED - stored in %s]\n", tokenFilePath)
 	fmt.Printf("  Stored at:      %s (mode 0600)\n", tokenFilePath)
 	fmt.Printf("  Bridge URL:     http://127.0.0.1:%d/api\n", port)
 	fmt.Println()
