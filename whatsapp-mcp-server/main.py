@@ -65,6 +65,17 @@ from whatsapp import (
 # so importing this module never parses env vars or exits the process.
 mcp = FastMCP("whatsapp")
 
+# Enforce strict read-only mode by default: no write tools registered
+READ_ONLY = os.getenv("WHATSAPP_READ_ONLY", "true").lower() in ("true", "1", "yes")
+
+def read_only_tool():
+    """Decorator to only register a tool if not in read-only mode."""
+    def decorator(fn):
+        if not READ_ONLY:
+            return mcp.tool()(fn)
+        return fn
+    return decorator
+
 PreviewDimension = Annotated[
     int,
     Field(
@@ -329,7 +340,7 @@ def get_message_context(message_id: str, before: int = 5, after: int = 5) -> dic
     }
 
 
-@mcp.tool()
+@read_only_tool()
 def send_message(
     recipient: str,
     message: str,
@@ -369,7 +380,7 @@ def send_message(
     return {"success": success, "message": status_message}
 
 
-@mcp.tool()
+@read_only_tool()
 def send_reaction(
     recipient: str,
     message_id: str,
@@ -395,7 +406,7 @@ def send_reaction(
     return {"success": success, "message": status_message}
 
 
-@mcp.tool()
+@read_only_tool()
 def mark_messages_read(
     message_ids: list[str],
     chat_jid: str,
@@ -420,7 +431,7 @@ def mark_messages_read(
     return {"success": success, "message": status_message}
 
 
-@mcp.tool()
+@read_only_tool()
 def send_file(recipient: str, media_path: str, caption: str = "") -> dict[str, Any]:
     """Send a file (image, video, document) via WhatsApp, optionally with a caption.
 
@@ -444,7 +455,7 @@ def send_file(recipient: str, media_path: str, caption: str = "") -> dict[str, A
     return {"success": success, "message": status_message}
 
 
-@mcp.tool()
+@read_only_tool()
 def send_audio_message(recipient: str, media_path: str) -> dict[str, Any]:
     """Send any audio file as a WhatsApp audio message to the specified recipient. For group messages use the JID. If it errors due to ffmpeg not being installed, use send_file instead.
 

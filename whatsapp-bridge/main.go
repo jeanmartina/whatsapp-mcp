@@ -50,6 +50,12 @@ func autoDownloadMediaEnabled() bool {
 	return getEnvBool("WHATSAPP_AUTO_DOWNLOAD_MEDIA", true)
 }
 
+// isReadOnlyMode reports whether the bridge is running in strict read-only mode.
+// Defaults to true for safety.
+func isReadOnlyMode() bool {
+	return getEnvBool("WHATSAPP_READ_ONLY", true)
+}
+
 // CLI flag: request a full history sync at pair time.
 // Only meaningful on a fresh pair (whatsapp.db deleted). See the usage block
 // near NewClient for the full rationale and caveats.
@@ -2413,6 +2419,10 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 
 	// Handler for sending messages
 	mux.HandleFunc("/api/send", auth(func(w http.ResponseWriter, r *http.Request) {
+		if isReadOnlyMode() {
+			http.Error(w, "Forbidden: WhatsApp bridge is running in strict read-only mode", http.StatusForbidden)
+			return
+		}
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -2482,6 +2492,10 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 
 	// Handler for explicitly sending read receipts for selected messages.
 	mux.HandleFunc("/api/mark-read", auth(func(w http.ResponseWriter, r *http.Request) {
+		if isReadOnlyMode() {
+			http.Error(w, "Forbidden: WhatsApp bridge is running in strict read-only mode", http.StatusForbidden)
+			return
+		}
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -2592,6 +2606,10 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 
 	// Handler for sending (or removing) emoji reactions
 	mux.HandleFunc("/api/react", auth(func(w http.ResponseWriter, r *http.Request) {
+		if isReadOnlyMode() {
+			http.Error(w, "Forbidden: WhatsApp bridge is running in strict read-only mode", http.StatusForbidden)
+			return
+		}
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -2707,6 +2725,10 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 
 	// Handler for sending typing indicator
 	mux.HandleFunc("/api/typing", auth(func(w http.ResponseWriter, r *http.Request) {
+		if isReadOnlyMode() {
+			http.Error(w, "Forbidden: WhatsApp bridge is running in strict read-only mode", http.StatusForbidden)
+			return
+		}
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
