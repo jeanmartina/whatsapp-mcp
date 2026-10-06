@@ -3268,12 +3268,12 @@ func main() {
 			logger.Infof("✓ Successfully connected to WhatsApp servers")
 			go func() {
 				// Resync AppState regular patches (such as labels/chat filters) in background
-				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 				defer cancel()
-				if err := client.FetchAppState(ctx, appstate.WAPatchRegular, false, false); err != nil {
+				if err := client.FetchAppState(ctx, appstate.WAPatchRegular, true, false); err != nil {
 					logger.Warnf("Failed to fetch regular app state: %v", err)
 				} else {
-					logger.Infof("✓ Regular app state sync complete")
+					logger.Infof("✓ Regular app state full sync complete")
 				}
 			}()
 
