@@ -29,6 +29,7 @@ import (
 	"bytes"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/appstate"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/proto/waCompanionReg"
 	"go.mau.fi/whatsmeow/store"
@@ -51,9 +52,17 @@ func autoDownloadMediaEnabled() bool {
 }
 
 // isReadOnlyMode reports whether the bridge is running in strict read-only mode.
-// Defaults to true for safety.
+// Defaults to false for backward compatibility with upstream.
+// If WHATSAPP_READ_ONLY is set to true, read-only is enforced.
+// If WHATSAPP_WRITE_ENABLED is explicitly set, write is allowed only when it is true.
 func isReadOnlyMode() bool {
-	return getEnvBool("WHATSAPP_READ_ONLY", true)
+	if getEnvBool("WHATSAPP_READ_ONLY", false) {
+		return true
+	}
+	if _, ok := os.LookupEnv("WHATSAPP_WRITE_ENABLED"); ok {
+		return !getEnvBool("WHATSAPP_WRITE_ENABLED", false)
+	}
+	return false
 }
 
 // CLI flag: request a full history sync at pair time.
@@ -302,7 +311,7 @@ func ensureMessageStoreSchema(db *sql.DB) error {
 		return fmt.Errorf("failed to ensure messages.quoted_message_id column: %w", err)
 	}
 
-	// Ensure SQLite FTS5 virtual table and synchronization triggers exist
+	// Ensure SQLite FTS5 virtual table and synchronization triggers exist if supported
 	_, err := db.Exec(`
 		CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
 			content,
@@ -321,7 +330,56 @@ func ensureMessageStoreSchema(db *sql.DB) error {
 		END;
 	`)
 	if err != nil {
-		return fmt.Errorf("failed to ensure messages_fts virtual table and triggers: %w", err)
+		if !strings.Contains(strings.ToLower(err.Error()), "fts5") && !strings.Contains(strings.ToLower(err.Error()), "no such module") {
+			return fmt.Errorf("failed to ensure messages_fts virtual table and triggers: %w", err)
+		}
+	}
+
+	// Ensure chat_lists and chat_list_items tables exist for WhatsApp labels and custom filters
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS chat_lists (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			color INTEGER DEFAULT 0,
+			type TEXT DEFAULT 'CUSTOM',
+			source TEXT DEFAULT 'whatsapp',
+			deleted BOOLEAN DEFAULT 0,
+			created_at TIMESTAMP,
+			updated_at TIMESTAMP
+		);
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_lists_name ON chat_lists(name) WHERE deleted = 0;
+
+		CREATE TABLE IF NOT EXISTS chat_list_items (
+			list_id TEXT NOT NULL,
+			chat_jid TEXT NOT NULL,
+			created_at TIMESTAMP,
+			PRIMARY KEY (list_id, chat_jid),
+			FOREIGN KEY (list_id) REFERENCES chat_lists(id) ON DELETE CASCADE,
+			FOREIGN KEY (chat_jid) REFERENCES chats(jid) ON DELETE CASCADE
+		);
+		CREATE INDEX IF NOT EXISTS idx_chat_list_items_chat_jid ON chat_list_items(chat_jid);
+
+		CREATE TABLE IF NOT EXISTS send_message_audit (
+			send_id TEXT PRIMARY KEY,
+			chat_jid TEXT NOT NULL,
+			recipient_name TEXT,
+			text TEXT NOT NULL,
+			text_sha256 TEXT NOT NULL,
+			reply_to_message_id TEXT,
+			authorization_code_hash TEXT NOT NULL,
+			status TEXT NOT NULL,
+			prepared_at TIMESTAMP NOT NULL,
+			expires_at TIMESTAMP NOT NULL,
+			authorized_at TIMESTAMP,
+			sent_at TIMESTAMP,
+			whatsapp_message_id TEXT,
+			error_message TEXT
+		);
+		CREATE INDEX IF NOT EXISTS idx_send_audit_status ON send_message_audit(status);
+		CREATE INDEX IF NOT EXISTS idx_send_audit_chat_jid ON send_message_audit(chat_jid);
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to ensure chat_lists and audit schema: %w", err)
 	}
 
 	return nil
@@ -978,6 +1036,44 @@ func (store *MessageStore) MarkMessageDeleted(messageID, chatJID string, deleted
 		 WHERE id = ? AND chat_jid = ? AND deleted_at IS NULL`,
 		deletedAt, messageID, chatJID,
 	)
+	return err
+}
+
+// StoreLabel persists or updates a WhatsApp label / custom list
+func (store *MessageStore) StoreLabel(id, name string, color int32, listType string, deleted bool, updatedAt time.Time) error {
+	now := time.Now()
+	if updatedAt.IsZero() {
+		updatedAt = now
+	}
+	query := `
+		INSERT INTO chat_lists (id, name, color, type, source, deleted, created_at, updated_at)
+		VALUES (?, ?, ?, ?, 'whatsapp', ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			name = excluded.name,
+			color = excluded.color,
+			type = excluded.type,
+			deleted = excluded.deleted,
+			updated_at = excluded.updated_at
+	`
+	_, err := store.db.Exec(query, id, name, color, listType, deleted, now, updatedAt)
+	return err
+}
+
+// StoreChatLabelAssociation links or unlinks a chat from a WhatsApp label
+func (store *MessageStore) StoreChatLabelAssociation(chatJID, labelID string, labeled bool, updatedAt time.Time) error {
+	now := time.Now()
+	if updatedAt.IsZero() {
+		updatedAt = now
+	}
+	if !labeled {
+		_, err := store.db.Exec(`DELETE FROM chat_list_items WHERE list_id = ? AND chat_jid = ?`, labelID, chatJID)
+		return err
+	}
+	query := `
+		INSERT OR IGNORE INTO chat_list_items (list_id, chat_jid, created_at)
+		VALUES (?, ?, ?)
+	`
+	_, err := store.db.Exec(query, labelID, chatJID, updatedAt)
 	return err
 }
 
@@ -3144,8 +3240,42 @@ func main() {
 				logger.Infof("Call terminated: id=%s reason=%q", v.CallID, v.Reason)
 			}
 
+		case *events.LabelEdit:
+			if v.Action != nil {
+				labelName := v.Action.GetName()
+				color := v.Action.GetColor()
+				deleted := v.Action.GetDeleted()
+				listType := v.Action.GetType().String()
+				if err := messageStore.StoreLabel(v.LabelID, labelName, color, listType, deleted, v.Timestamp); err != nil {
+					logger.Warnf("Failed to store label %s (%s): %v", v.LabelID, labelName, err)
+				} else {
+					logger.Infof("Stored WhatsApp label: id=%s name=%q type=%s deleted=%v", v.LabelID, labelName, listType, deleted)
+				}
+			}
+
+		case *events.LabelAssociationChat:
+			if v.Action != nil {
+				labeled := v.Action.GetLabeled()
+				chatJID := resolveLIDChat(client, v.JID, types.EmptyJID, types.EmptyJID, false).String()
+				if err := messageStore.StoreChatLabelAssociation(chatJID, v.LabelID, labeled, v.Timestamp); err != nil {
+					logger.Warnf("Failed to store chat label association %s <-> %s: %v", chatJID, v.LabelID, err)
+				} else {
+					logger.Infof("Stored chat label association: chat=%s label=%s labeled=%v", chatJID, v.LabelID, labeled)
+				}
+			}
+
 		case *events.Connected:
 			logger.Infof("✓ Successfully connected to WhatsApp servers")
+			go func() {
+				// Resync AppState regular patches (such as labels/chat filters) in background
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				if err := client.FetchAppState(ctx, appstate.WAPatchRegular, false, false); err != nil {
+					logger.Warnf("Failed to fetch regular app state: %v", err)
+				} else {
+					logger.Infof("✓ Regular app state sync complete")
+				}
+			}()
 
 		case *events.LoggedOut:
 			logger.Warnf("⚠️  Device logged out, please scan QR code to log in again")
