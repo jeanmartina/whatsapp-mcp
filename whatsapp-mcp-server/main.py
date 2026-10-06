@@ -5,6 +5,7 @@ import tempfile
 from typing import Annotated, Any
 
 from mcp.server.fastmcp import FastMCP, Image
+from mcp.server.lowlevel.server import NotificationOptions
 from pydantic import Field
 
 import media_preview
@@ -85,6 +86,24 @@ from whatsapp import (
 # Initialize FastMCP server. Env-var handling is deferred to the __main__ block
 # so importing this module never parses env vars or exits the process.
 mcp = FastMCP("whatsapp")
+
+# Advertise tools listChanged capability so clients (ChatGPT, Claude, etc.) know tools can be updated
+_orig_create_initialization_options = mcp._mcp_server.create_initialization_options
+
+
+def _custom_create_initialization_options(
+    notification_options: NotificationOptions | None = None,
+    experimental_capabilities: dict[str, dict[str, Any]] | None = None,
+) -> Any:
+    opts = notification_options or NotificationOptions()
+    opts.tools_changed = True
+    return _orig_create_initialization_options(
+        notification_options=opts,
+        experimental_capabilities=experimental_capabilities,
+    )
+
+
+mcp._mcp_server.create_initialization_options = _custom_create_initialization_options
 
 # Enforce strict read-only mode by default: no write tools registered
 READ_ONLY = os.getenv("WHATSAPP_READ_ONLY", "true").lower() in ("true", "1", "yes")
