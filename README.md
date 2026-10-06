@@ -21,12 +21,9 @@ A Model Context Protocol (MCP) server for WhatsApp, enabling Claude to read and 
 
 - **Message Management**: Search and read personal WhatsApp messages (text, images, videos, documents, audio)
 - **Contact Search**: Search contacts by name or phone number with `sender_display` format ("Name (phone)")
-- **Send Messages**: Send text messages to individuals or groups
-- **Read Receipts**: Explicitly mark selected messages as read across linked devices
-- **Media Support**: Send and download images, videos, documents, and voice messages
-- **Call History**: Capture incoming voice/video calls into a local SQLite table (live, 1:1 and group)
-- **Webhook Integration**: Forward incoming messages to external services
-- **Local Storage**: All messages stored locally in SQLite - only sent to Claude when you allow it
+- **Custom Chat Lists & Filters**: Sync native WhatsApp labels/filters (such as "Para responder") and create local chat lists for chat triage
+- **Safe Two-Phase Sending**: Strict human-authorized message sending (`prepare_send_message` → confirmation code → `commit_send_message`) with SHA-256 fingerprinting, replay prevention, and audit logs
+- **Local Storage & Privacy**: All messages stored locally in SQLite - never shared with external services without permission
 
 ## Installation
 
@@ -180,80 +177,107 @@ Get messages with filters, date ranges, and sorting.
 - "Get messages from the family group chat"
 - "Find messages from last week"
 
-#### `send_message`
+### Custom Chat Lists & Filters
 
-Send a text message to a contact or group, optionally as a quoted reply.
+Query and manage WhatsApp labels and custom filters (e.g., "Para responder", "Follow up") for structured chat triage.
 
-**Parameters:**
+#### `list_chat_lists`
 
-- `recipient` (required): Phone number or group JID
-- `message` (required): Text content to send
-- `quoted_message_id` (optional): ID of the message to reply to. When provided, the sent message appears as a quoted reply in WhatsApp.
-- `quoted_sender_jid` (optional): Full JID of the author of the quoted message. Required for group replies so WhatsApp renders the correct attribution header.
-- `quoted_content` (optional): Text content of the quoted message, used for the reply preview. Only plain text is supported.
-- `mentions` (optional): List of users to @-mention, as phone numbers with country code (e.g. `["12025551234"]`) or JIDs. For each entry the message text must contain a matching `@<number>` token (e.g. `"thanks @12025551234!"`), which recipients' devices render as a highlighted, tappable mention that also notifies the user. Only meaningful in group chats.
-
-Inbound quoted replies are stored automatically. The `quoted_message_id` field in each message returned by `list_messages` indicates which message it is replying to (or `null` for non-replies).
+List all available WhatsApp labels and custom chat lists along with their chat counts.
 
 **Natural Language Examples:**
+- "Show me my WhatsApp chat lists"
+- "What filters or lists do I have in WhatsApp?"
 
-- "Send 'Hello!' to +1234567890"
-- "Message the team group saying 'Meeting at 3pm'"
-- "Reply to that message saying 'Sounds good'"
+#### `list_chats_by_list`
 
-#### `mark_messages_read`
-
-Mark one or more messages from the same chat and sender as read. This explicitly
-sends WhatsApp read receipts; reading or searching messages never does so
-automatically.
+Retrieve chats that belong to a specific WhatsApp label or custom list. Returns the identical schema as `list_chats()`.
 
 **Parameters:**
-
-- `message_ids` (required): IDs of messages from the same chat and sender
-- `chat_jid` (required): JID of the chat containing the messages
-- `sender_jid` (required for groups): Full JID or bare phone number of the original message sender
-- `timestamp` (optional): RFC 3339 read timestamp; defaults to the current time
+- `list_name` (optional): Name of the list (e.g., "Para responder")
+- `list_id` (optional): ID of the list
+- `limit` (optional): Number of chats (default 50, max 200)
+- `page` (optional): Page number (default 0)
+- `include_last_message` (optional): Include content of the last message (default `true`)
+- `sort_by` (optional): "last_active" (default) or "name"
 
 **Natural Language Examples:**
+- "Show the conversations in my 'Para responder' list"
+- "Process the chats in 'Para responder'"
+- "List unread messages in the 'Follow up' list"
 
-- "Mark those messages as read"
-- "Mark the last three messages from Alice in the team group as read"
+#### `get_chat_lists`
 
-#### `send_reaction`
-
-Send (or remove) an emoji reaction to a message.
+Find which lists/labels a specific chat belongs to.
 
 **Parameters:**
+- `chat_jid` (required): Full JID of the chat
 
-- `recipient` (required): Chat JID the message belongs to (phone JID or group JID)
-- `message_id` (required): ID of the message to react to
-- `emoji` (required): Reaction emoji (e.g. `"👍"`). Pass an empty string `""` to remove an existing reaction.
-- `from_me` (optional, default `false`): Whether the original message was sent by the current user
-- `sender_jid` (optional): Full JID of the original message sender — required for group messages when `from_me` is `false` so the correct WhatsApp key is built
+#### `create_chat_list`, `add_chat_to_list`, `remove_chat_from_list`
 
-Inbound reactions received from others are stored automatically as messages with `media_type = "reaction"`. The `reaction_to_message_id` field in each reaction message indicates which message was reacted to.
+Manage local lists and assign or unassign chats:
+- `create_chat_list(name)`: Create a new custom list/filter
+- `add_chat_to_list(list_name, chat_jid)`: Add a chat to a list
+- `remove_chat_from_list(list_name, chat_jid)`: Remove a chat from a list
 
-When webhook forwarding is enabled, inbound reactions are also posted to `WEBHOOK_URL` as typed events. Reaction removals use an empty `content`/`reactionEmoji` and `reactionRemoved: true`.
+---
 
+### Safe Two-Phase Message Operations
+
+To prevent accidental, hallucinated, or unauthorized outgoing messages, single-step `send_message` tools are strictly disabled. All message delivery requires an explicit two-phase workflow with human confirmation.
+
+#### Architecture & Safety Guarantees
+
+1. **Global Safety Flag**: `WHATSAPP_WRITE_ENABLED=false` by default. When false, write attempts fail immediately with an explicit administrative permission error.
+2. **Phase 1 (`prepare_send_message`)**: Prepares a draft locally, computes a SHA-256 fingerprint, and generates a single-use authorization code (e.g. `ENVIAR K7M4`) with a 10-minute expiry. **Never sends anything to WhatsApp.**
+3. **Phase 2 (`commit_send_message`)**: The only tool authorized to transmit to WhatsApp. Verifies that the draft exists, has not expired, has not been used before, matches the SHA-256 hash, and that the authorization code was supplied exactly.
+4. **Audit Logging**: Every draft preparation, authorization code verification, and send result is recorded in the `send_message_audit` SQLite table.
+
+#### `prepare_send_message`
+
+Prepare a message draft and generate an authorization code.
+
+**Parameters:**
+- `chat_jid` (required): Target chat JID or phone number
+- `text` (required): Exact message text to send
+- `reply_to_message_id` (optional): ID of the message to reply to
+
+**Returns:**
 ```json
 {
-  "eventType": "reaction",
-  "sender": "15551234567",
-  "chatJID": "15551234567@s.whatsapp.net",
-  "isFromMe": true,
-  "content": "👍",
-  "messageId": "reaction-stanza-id",
-  "mediaType": "reaction",
-  "reactionToMessageId": "target-message-id",
-  "reactionEmoji": "👍",
-  "reactionRemoved": false
+  "send_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+  "chat_jid": "554899999999@s.whatsapp.net",
+  "recipient_name": "Alice",
+  "text": "Olá Alice, confirmado para as 15h!",
+  "text_sha256": "4a5e...",
+  "expires_at": "2026-10-06T15:30:00+00:00",
+  "authorization_code": "ENVIAR K7M4"
 }
 ```
 
-**Natural Language Examples:**
+#### `commit_send_message`
 
-- "React to that message with a thumbs up"
-- "Remove my reaction from the last message in the group chat"
+Authorize and execute transmission of a prepared draft.
+
+**Parameters:**
+- `send_id` (required): Draft ID returned by `prepare_send_message`
+- `authorization_code` (required): Exact authorization code (e.g., `ENVIAR K7M4`)
+
+#### Recommended LLM System Prompt Instructions
+
+When integrating with ChatGPT or Claude, include the following instructions in the system prompt:
+
+```markdown
+When the user asks to send a WhatsApp message:
+1. First, call `prepare_send_message(chat_jid, text)` to stage the message draft.
+2. Present the prepared draft clearly to the user:
+   - Target recipient and chat
+   - Exact text content
+   - Authorization code (e.g. "ENVIAR K7M4")
+3. Tell the user: "Para confirmar o envio desta mensagem, responda com o código de autorização: `ENVIAR XXXX`".
+4. ONLY call `commit_send_message(send_id, authorization_code)` after the user explicitly types the confirmation code.
+5. If the user edits the message text or changes the recipient, discard the previous draft and call `prepare_send_message` again.
+```
 
 #### `send_file`
 
