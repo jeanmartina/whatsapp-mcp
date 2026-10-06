@@ -16,10 +16,28 @@ from whatsapp import (
     msg_to_dict,
 )
 from whatsapp import (
+    add_chat_to_list as whatsapp_add_chat_to_list,
+)
+from whatsapp import (
+    catch_up as whatsapp_catch_up,
+)
+from whatsapp import (
+    commit_send_message as whatsapp_commit_send_message,
+)
+from whatsapp import (
+    create_chat_list as whatsapp_create_chat_list,
+)
+from whatsapp import (
     download_media as whatsapp_download_media,
 )
 from whatsapp import (
+    extract_action_items as whatsapp_extract_action_items,
+)
+from whatsapp import (
     get_chat as whatsapp_get_chat,
+)
+from whatsapp import (
+    get_chat_lists as whatsapp_get_chat_lists,
 )
 from whatsapp import (
     get_contact_chats as whatsapp_get_contact_chats,
@@ -37,33 +55,30 @@ from whatsapp import (
     get_sender_name as whatsapp_get_sender_name,
 )
 from whatsapp import (
+    list_chat_lists as whatsapp_list_chat_lists,
+)
+from whatsapp import (
     list_chats as whatsapp_list_chats,
+)
+from whatsapp import (
+    list_chats_by_list as whatsapp_list_chats_by_list,
 )
 from whatsapp import (
     list_messages as whatsapp_list_messages,
 )
 from whatsapp import (
-    mark_messages_read as whatsapp_mark_messages_read,
+    list_unread_chats as whatsapp_list_unread_chats,
+)
+from whatsapp import (
+    prepare_send_message as whatsapp_prepare_send_message,
+)
+from whatsapp import (
+    remove_chat_from_list as whatsapp_remove_chat_from_list,
 )
 from whatsapp import (
     search_contacts as whatsapp_search_contacts,
 )
 from whatsapp import (
-    send_audio_message as whatsapp_audio_voice_message,
-)
-from whatsapp import (
-    send_file as whatsapp_send_file,
-)
-from whatsapp import (
-    send_message as whatsapp_send_message,
-)
-from whatsapp import (
-    send_reaction as whatsapp_send_reaction,
-)
-from whatsapp import (
-    catch_up as whatsapp_catch_up,
-    extract_action_items as whatsapp_extract_action_items,
-    list_unread_chats as whatsapp_list_unread_chats,
     search_messages as whatsapp_search_messages,
 )
 
@@ -74,13 +89,17 @@ mcp = FastMCP("whatsapp")
 # Enforce strict read-only mode by default: no write tools registered
 READ_ONLY = os.getenv("WHATSAPP_READ_ONLY", "true").lower() in ("true", "1", "yes")
 
+
 def read_only_tool():
     """Decorator to only register a tool if not in read-only mode."""
+
     def decorator(fn):
         if not READ_ONLY:
             return mcp.tool()(fn)
         return fn
+
     return decorator
+
 
 PreviewDimension = Annotated[
     int,
@@ -348,12 +367,28 @@ def get_message_context(message_id: str, before: int = 5, after: int = 5) -> dic
 
 @mcp.tool()
 def search_messages(
-    query: Annotated[str, Field(description="Search query across all messages. Supports exact phrases in quotes, boolean AND/OR/NOT, and prefix wildcards (e.g. 'termo*')")],
-    chat_jid: Annotated[str | None, Field(description="Optional chat JID to filter messages to a specific conversation")] = None,
-    sender_phone_number: Annotated[str | None, Field(description="Optional phone number to filter messages by sender")] = None,
+    query: Annotated[
+        str,
+        Field(
+            description="Search query across all messages. Supports exact phrases in quotes, boolean AND/OR/NOT, and prefix wildcards (e.g. 'termo*')"
+        ),
+    ],
+    chat_jid: Annotated[
+        str | None, Field(description="Optional chat JID to filter messages to a specific conversation")
+    ] = None,
+    sender_phone_number: Annotated[
+        str | None, Field(description="Optional phone number to filter messages by sender")
+    ] = None,
     after: Annotated[str | None, Field(description="Optional ISO timestamp to filter messages after this date")] = None,
-    before: Annotated[str | None, Field(description="Optional ISO timestamp to filter messages before this date")] = None,
-    timeframe: Annotated[str | None, Field(description="Optional natural timeframe preset: 'today', 'yesterday', 'last_24_hours', 'last_3_days', 'this_week', 'last_7_days', 'last_30_days', 'last_6_months'")] = None,
+    before: Annotated[
+        str | None, Field(description="Optional ISO timestamp to filter messages before this date")
+    ] = None,
+    timeframe: Annotated[
+        str | None,
+        Field(
+            description="Optional natural timeframe preset: 'today', 'yesterday', 'last_24_hours', 'last_3_days', 'this_week', 'last_7_days', 'last_30_days', 'last_6_months'"
+        ),
+    ] = None,
     limit: Annotated[int, Field(description="Maximum number of messages to return (default 20)")] = 20,
     page: Annotated[int, Field(description="Page number for pagination (default 0)")] = 0,
 ) -> list[dict[str, Any]]:
@@ -372,7 +407,12 @@ def search_messages(
 
 @mcp.tool()
 def catch_up(
-    timeframe: Annotated[str, Field(description="Timeframe for the activity digest: 'today', 'yesterday', 'last_24_hours', 'last_3_days', 'this_week', 'last_7_days', 'last_30_days'")] = "today",
+    timeframe: Annotated[
+        str,
+        Field(
+            description="Timeframe for the activity digest: 'today', 'yesterday', 'last_24_hours', 'last_3_days', 'this_week', 'last_7_days', 'last_30_days'"
+        ),
+    ] = "today",
     only_groups: Annotated[bool, Field(description="Whether to only include group chats in the digest")] = False,
     limit_chats: Annotated[int, Field(description="Maximum number of active chats to highlight (default 10)")] = 10,
 ) -> dict[str, Any]:
@@ -402,8 +442,12 @@ def list_unread_chats(
 
 @mcp.tool()
 def extract_action_items(
-    chat_jid: Annotated[str | None, Field(description="Optional chat JID to filter messages to a specific conversation")] = None,
-    timeframe: Annotated[str, Field(description="Timeframe to scan: 'today', 'last_3_days', 'this_week', 'last_7_days', 'last_30_days'")] = "last_7_days",
+    chat_jid: Annotated[
+        str | None, Field(description="Optional chat JID to filter messages to a specific conversation")
+    ] = None,
+    timeframe: Annotated[
+        str, Field(description="Timeframe to scan: 'today', 'last_3_days', 'this_week', 'last_7_days', 'last_30_days'")
+    ] = "last_7_days",
     limit: Annotated[int, Field(description="Maximum number of action items to extract (default 20)")] = 20,
 ) -> list[dict[str, Any]]:
     """Extract action items, asks, commitments, and deadlines from recent conversations."""
@@ -414,135 +458,154 @@ def extract_action_items(
     )
 
 
-@read_only_tool()
-def send_message(
-    recipient: str,
-    message: str,
-    quoted_message_id: str = "",
-    quoted_sender_jid: str = "",
-    quoted_content: str = "",
-    mentions: list[str] | None = None,
-) -> dict[str, Any]:
-    """Send a WhatsApp message to a person or group. For group chats use the JID.
-
-    Args:
-        recipient: The recipient - either a phone number with country code but no + or other symbols,
-                 or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
-        message: The message text to send
-        quoted_message_id: ID of the message to reply to (optional). When set, the sent
-                           message will appear as a quoted reply in WhatsApp.
-        quoted_sender_jid: Full JID of the author of the quoted message. Required for
-                           group replies so WhatsApp renders the correct attribution.
-        quoted_content: Text content of the quoted message, used for the reply preview.
-                        Only plain text is supported; media previews are not included.
-        mentions: Users to @-mention, as phone numbers with country code but no + (e.g.
-                  ["420601234567"]) or JIDs. For each entry the message text must contain
-                  a matching "@<number>" token (e.g. "hi @420601234567"), otherwise the
-                  mention won't render on recipients' devices. Only meaningful in groups.
-
-    Returns:
-        A dictionary containing success status and a status message
-    """
-    # Validate input
-    if not recipient:
-        return {"success": False, "message": "Recipient must be provided"}
-
-    # Call the whatsapp_send_message function with the unified recipient parameter
-    success, status_message = whatsapp_send_message(
-        recipient, message, quoted_message_id, quoted_sender_jid, quoted_content, mentions
-    )
-    return {"success": success, "message": status_message}
-
-
-@read_only_tool()
-def send_reaction(
-    recipient: str,
-    message_id: str,
-    emoji: str,
-    from_me: bool = False,
-    sender_jid: str = "",
-) -> dict[str, Any]:
-    """Send (or remove) a reaction to a WhatsApp message.
-
-    Args:
-        recipient: The chat JID the message belongs to (e.g., "12025551234@s.whatsapp.net"
-                   or a group JID like "123456789@g.us")
-        message_id: The ID of the message to react to
-        emoji: The reaction emoji (e.g., "👍"). Pass an empty string to remove the reaction.
-        from_me: Whether the original message was sent by the current user (default False)
-        sender_jid: JID of the original message sender — required for group messages when
-                    from_me is False so the bridge can build the correct WhatsApp key
-
-    Returns:
-        A dictionary containing success status and a status message
-    """
-    success, status_message = whatsapp_send_reaction(recipient, message_id, emoji, from_me, sender_jid)
-    return {"success": success, "message": status_message}
-
-
-@read_only_tool()
-def mark_messages_read(
-    message_ids: list[str],
+@mcp.tool()
+def prepare_send_message(
     chat_jid: str,
-    sender_jid: str = "",
-    timestamp: str | None = None,
+    text: str,
+    reply_to_message_id: str | None = None,
 ) -> dict[str, Any]:
-    """Mark selected WhatsApp messages as read and send read receipts.
+    """Phase 1 of safe message sending: prepare a message draft and generate an authorization code.
 
-    This is an explicit external side effect. All message IDs must belong to the
-    same chat and sender.
-
-    Args:
-        message_ids: IDs of the messages to mark as read
-        chat_jid: JID of the chat containing the messages
-        sender_jid: JID or bare phone number of the original sender; required for groups
-        timestamp: Optional RFC 3339 read timestamp; defaults to the current time
-
-    Returns:
-        A dictionary containing success status and a status message
-    """
-    success, status_message = whatsapp_mark_messages_read(message_ids, chat_jid, sender_jid, timestamp)
-    return {"success": success, "message": status_message}
-
-
-@read_only_tool()
-def send_file(recipient: str, media_path: str, caption: str = "") -> dict[str, Any]:
-    """Send a file (image, video, document) via WhatsApp, optionally with a caption.
-
-    When `caption` is provided, the file and text arrive as a single
-    attachment-with-caption message (one bubble in the WA UI), instead of
-    needing a separate follow-up send_message call. For group chats use the JID.
+    SECURITY GUARANTEE: This function NEVER sends anything to WhatsApp.
+    It prepares a draft, computes a SHA-256 fingerprint, and generates a single-use
+    confirmation code (e.g. 'ENVIAR K7M4') valid for 10 minutes.
+    The message will ONLY be dispatched if commit_send_message is subsequently called
+    with the exact authorization code and server write permissions are enabled.
 
     Args:
-        recipient: Either a phone number with country code (no + or symbols),
-                 or a JID (e.g., "123456789@s.whatsapp.net" or "123456789@g.us")
-        media_path: Absolute path to the media file (image, video, document)
-        caption: Optional text rendered with the file as a caption. Omit for a
-                 bare attachment.
+        chat_jid: Target chat JID or phone number (e.g. '554899999999@s.whatsapp.net' or group JID)
+        text: Exact message text to send
+        reply_to_message_id: Optional ID of the message to reply to
 
     Returns:
-        A dictionary containing success status and a status message
+        Draft details including send_id, text_sha256, expires_at, and authorization_code.
     """
+    return whatsapp_prepare_send_message(
+        chat_jid=chat_jid,
+        text=text,
+        reply_to_message_id=reply_to_message_id,
+    )
 
-    # Call the whatsapp_send_file function
-    success, status_message = whatsapp_send_file(recipient, media_path, caption)
-    return {"success": success, "message": status_message}
 
+@mcp.tool()
+def commit_send_message(
+    send_id: str,
+    authorization_code: str,
+) -> dict[str, Any]:
+    """Phase 2 of safe message sending: authorize and dispatch a prepared message draft.
 
-@read_only_tool()
-def send_audio_message(recipient: str, media_path: str) -> dict[str, Any]:
-    """Send any audio file as a WhatsApp audio message to the specified recipient. For group messages use the JID. If it errors due to ffmpeg not being installed, use send_file instead.
+    SECURITY GUARANTEE: This is the ONLY function that can send messages to WhatsApp.
+    Requires server write permissions (WHATSAPP_WRITE_ENABLED=true) and verifies
+    the single-use authorization code (e.g. 'ENVIAR K7M4') generated during Phase 1.
 
     Args:
-        recipient: The recipient - either a phone number with country code but no + or other symbols,
-                 or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
-        media_path: The absolute path to the audio file to send (will be converted to Opus .ogg if it's not a .ogg file)
+        send_id: ID of the prepared draft from prepare_send_message
+        authorization_code: Confirmation code (e.g. 'ENVIAR K7M4')
 
     Returns:
-        A dictionary containing success status and a status message
+        Send status dictionary.
     """
-    success, status_message = whatsapp_audio_voice_message(recipient, media_path)
-    return {"success": success, "message": status_message}
+    return whatsapp_commit_send_message(
+        send_id=send_id,
+        authorization_code=authorization_code,
+    )
+
+
+@mcp.tool()
+def list_chat_lists() -> list[dict[str, Any]]:
+    """List all WhatsApp labels and custom chat lists (e.g. 'Para responder') with chat counts.
+
+    Returns:
+        List of chat lists with id, name, type, source, and chat_count.
+    """
+    return whatsapp_list_chat_lists()
+
+
+@mcp.tool()
+def list_chats_by_list(
+    list_name: str | None = None,
+    list_id: str | None = None,
+    limit: int = 50,
+    page: int = 0,
+    include_last_message: bool = True,
+    sort_by: str = "last_active",
+) -> list[dict[str, Any]]:
+    """Get chats belonging to a WhatsApp label or custom list (e.g. 'Para responder').
+
+    Args:
+        list_name: Name of the chat list/label
+        list_id: ID of the chat list/label
+        limit: Max chats to return (default 50, max 200)
+        page: Page number for pagination (default 0)
+        include_last_message: Include the last message in each chat (default True)
+        sort_by: 'last_active' (default, most recent first) or 'name' (alphabetical)
+
+    Returns:
+        List of chat dictionaries with the same structure as list_chats.
+    """
+    limit = min(limit, 200)
+    return whatsapp_list_chats_by_list(
+        list_name=list_name,
+        list_id=list_id,
+        limit=limit,
+        page=page,
+        include_last_message=include_last_message,
+        sort_by=sort_by,
+    )
+
+
+@mcp.tool()
+def get_chat_lists(chat_jid: str) -> list[dict[str, Any]]:
+    """Get all lists/labels to which a chat belongs.
+
+    Args:
+        chat_jid: WhatsApp JID of the chat
+
+    Returns:
+        List of lists/labels the chat is part of.
+    """
+    return whatsapp_get_chat_lists(chat_jid)
+
+
+@mcp.tool()
+def create_chat_list(name: str) -> dict[str, Any]:
+    """Create a new local chat list / filter tag (e.g. 'Para responder').
+
+    Args:
+        name: Name for the chat list
+
+    Returns:
+        Dictionary with list ID, name, and status.
+    """
+    return whatsapp_create_chat_list(name)
+
+
+@mcp.tool()
+def add_chat_to_list(list_name: str, chat_jid: str) -> dict[str, Any]:
+    """Add a chat to a list/label.
+
+    Args:
+        list_name: Name or ID of the list
+        chat_jid: WhatsApp JID of the chat to add
+
+    Returns:
+        Status dictionary.
+    """
+    return whatsapp_add_chat_to_list(list_name, chat_jid)
+
+
+@mcp.tool()
+def remove_chat_from_list(list_name: str, chat_jid: str) -> dict[str, Any]:
+    """Remove a chat from a list/label.
+
+    Args:
+        list_name: Name or ID of the list
+        chat_jid: WhatsApp JID of the chat to remove
+
+    Returns:
+        Status dictionary.
+    """
+    return whatsapp_remove_chat_from_list(list_name, chat_jid)
 
 
 @mcp.tool()

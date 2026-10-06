@@ -1,9 +1,12 @@
+import hashlib
 import json
 import os
 import os.path
+import random
 import sqlite3
+import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import requests
@@ -44,6 +47,67 @@ def _bridge_headers() -> dict[str, str]:
     if not token:
         return {}
     return {"Authorization": f"Bearer {token}"}
+
+
+def is_write_enabled() -> bool:
+    """Return whether write operations (such as message sending) are enabled."""
+    return os.getenv("WHATSAPP_WRITE_ENABLED", "false").lower() in ("true", "1", "yes")
+
+
+def _ensure_chat_list_schema(conn: sqlite3.Connection) -> None:
+    """Ensure chat_lists, chat_list_items, and send_message_audit tables exist."""
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS chat_lists (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            color INTEGER DEFAULT 0,
+            type TEXT DEFAULT 'CUSTOM',
+            source TEXT DEFAULT 'whatsapp',
+            deleted BOOLEAN DEFAULT 0,
+            created_at TIMESTAMP,
+            updated_at TIMESTAMP
+        );
+    """)
+    cursor.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_lists_name ON chat_lists(name) WHERE deleted = 0;
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS chat_list_items (
+            list_id TEXT NOT NULL,
+            chat_jid TEXT NOT NULL,
+            created_at TIMESTAMP,
+            PRIMARY KEY (list_id, chat_jid)
+        );
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_chat_list_items_chat_jid ON chat_list_items(chat_jid);
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS send_message_audit (
+            send_id TEXT PRIMARY KEY,
+            chat_jid TEXT NOT NULL,
+            recipient_name TEXT,
+            text TEXT NOT NULL,
+            text_sha256 TEXT NOT NULL,
+            reply_to_message_id TEXT,
+            authorization_code_hash TEXT NOT NULL,
+            status TEXT NOT NULL,
+            prepared_at TIMESTAMP NOT NULL,
+            expires_at TIMESTAMP NOT NULL,
+            authorized_at TIMESTAMP,
+            sent_at TIMESTAMP,
+            whatsapp_message_id TEXT,
+            error_message TEXT
+        );
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_send_audit_status ON send_message_audit(status);
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_send_audit_chat_jid ON send_message_audit(chat_jid);
+    """)
+    conn.commit()
 
 
 @dataclass
@@ -1372,16 +1436,16 @@ def search_messages(
     offset = page * limit
 
     fts_sql = """
-        SELECT 
-            m.timestamp, 
-            m.sender, 
-            chats.name, 
-            m.content, 
-            m.is_from_me, 
-            chats.jid, 
-            m.id, 
-            m.media_type, 
-            m.quoted_message_id, 
+        SELECT
+            m.timestamp,
+            m.sender,
+            chats.name,
+            m.content,
+            m.is_from_me,
+            chats.jid,
+            m.id,
+            m.media_type,
+            m.quoted_message_id,
             m.filename,
             snippet(messages_fts, 0, '«', '»', '...', 15) AS match_snippet
         FROM messages_fts f
@@ -1422,16 +1486,16 @@ def search_messages(
     except sqlite3.OperationalError:
         # Fallback to substring matching if FTS syntax is invalid
         fallback_sql = """
-            SELECT 
-                m.timestamp, 
-                m.sender, 
-                chats.name, 
-                m.content, 
-                m.is_from_me, 
-                chats.jid, 
-                m.id, 
-                m.media_type, 
-                m.quoted_message_id, 
+            SELECT
+                m.timestamp,
+                m.sender,
+                chats.name,
+                m.content,
+                m.is_from_me,
+                chats.jid,
+                m.id,
+                m.media_type,
+                m.quoted_message_id,
                 m.filename,
                 m.content AS match_snippet
             FROM messages m
@@ -1464,19 +1528,21 @@ def search_messages(
 
     results = []
     for r in rows:
-        results.append({
-            "id": r[6],
-            "timestamp": r[0],
-            "chat_jid": r[5],
-            "chat_name": r[2] or r[5],
-            "sender": r[1],
-            "sender_name": get_sender_name(r[1]) if r[1] else None,
-            "is_from_me": bool(r[4]),
-            "content": r[3],
-            "match_snippet": r[10],
-            "media_type": r[7] if r[7] else None,
-            "quoted_message_id": r[8] if r[8] else None,
-        })
+        results.append(
+            {
+                "id": r[6],
+                "timestamp": r[0],
+                "chat_jid": r[5],
+                "chat_name": r[2] or r[5],
+                "sender": r[1],
+                "sender_name": get_sender_name(r[1]) if r[1] else None,
+                "is_from_me": bool(r[4]),
+                "content": r[3],
+                "match_snippet": r[10],
+                "media_type": r[7] if r[7] else None,
+                "quoted_message_id": r[8] if r[8] else None,
+            }
+        )
     return results
 
 
@@ -1507,14 +1573,16 @@ def catch_up(
 
     where_str = " AND ".join(where_clauses)
 
-    cursor.execute(f"SELECT COUNT(*) FROM messages m JOIN chats c ON m.chat_jid = c.jid WHERE {where_str}", tuple(params))
+    cursor.execute(
+        f"SELECT COUNT(*) FROM messages m JOIN chats c ON m.chat_jid = c.jid WHERE {where_str}", tuple(params)
+    )
     total_messages = cursor.fetchone()[0]
 
     active_chats_sql = f"""
-        SELECT 
-            c.jid, 
-            c.name, 
-            COUNT(m.id) AS msg_count, 
+        SELECT
+            c.jid,
+            c.name,
+            COUNT(m.id) AS msg_count,
             MAX(m.timestamp) AS last_activity
         FROM messages m
         JOIN chats c ON m.chat_jid = c.jid
@@ -1550,14 +1618,16 @@ def catch_up(
             }
             for r in cursor.fetchall()
         ]
-        active_chats.append({
-            "jid": chat_jid,
-            "name": chat_name or chat_jid,
-            "is_group": chat_jid.endswith("@g.us"),
-            "message_count": count,
-            "last_activity": last_act,
-            "recent_messages": recent,
-        })
+        active_chats.append(
+            {
+                "jid": chat_jid,
+                "name": chat_name or chat_jid,
+                "is_group": chat_jid.endswith("@g.us"),
+                "message_count": count,
+                "last_activity": last_act,
+                "recent_messages": recent,
+            }
+        )
 
     q_params = list(params)
     cursor.execute(
@@ -1624,15 +1694,15 @@ def list_unread_chats(only_groups: bool = False, limit: int = 30) -> list[dict[s
 
     group_clause = "AND c.jid LIKE '%@g.us'" if only_groups else ""
     query = f"""
-        SELECT 
-            c.jid, 
-            c.name, 
-            COUNT(m.id) AS unread_count, 
+        SELECT
+            c.jid,
+            c.name,
+            COUNT(m.id) AS unread_count,
             MAX(m.timestamp) AS last_message_time,
             c.last_read_time
         FROM messages m
         JOIN chats c ON m.chat_jid = c.jid
-        WHERE m.is_from_me = 0 
+        WHERE m.is_from_me = 0
           AND (c.last_read_time IS NULL OR m.timestamp > c.last_read_time)
           {group_clause}
         GROUP BY c.jid
@@ -1666,15 +1736,17 @@ def list_unread_chats(only_groups: bool = False, limit: int = 30) -> list[dict[s
                 "media_type": last_msg[3] or None,
             }
 
-        results.append({
-            "jid": chat_jid,
-            "name": chat_name or chat_jid,
-            "is_group": chat_jid.endswith("@g.us"),
-            "unread_count": unread_count,
-            "last_message_time": last_time,
-            "last_read_time": last_read,
-            "latest_incoming_message": last_preview,
-        })
+        results.append(
+            {
+                "jid": chat_jid,
+                "name": chat_name or chat_jid,
+                "is_group": chat_jid.endswith("@g.us"),
+                "unread_count": unread_count,
+                "last_message_time": last_time,
+                "last_read_time": last_read,
+                "latest_incoming_message": last_preview,
+            }
+        )
     return results
 
 
@@ -1701,10 +1773,33 @@ def extract_action_items(
         params.append(chat_jid)
 
     keywords = [
-        "preciso", "favor", "pode enviar", "pode fazer", "pode me", "me envia", "me passa",
-        "combinado", "reunião", "reuniao", "até amanhã", "ate amanha", "segunda", "sexta",
-        "assinar", "enviar", "aprovar", "template", "link", "aguardo", "urgente", "deadline",
-        "please", "can you", "let's schedule", "todo", "action item"
+        "preciso",
+        "favor",
+        "pode enviar",
+        "pode fazer",
+        "pode me",
+        "me envia",
+        "me passa",
+        "combinado",
+        "reunião",
+        "reuniao",
+        "até amanhã",
+        "ate amanha",
+        "segunda",
+        "sexta",
+        "assinar",
+        "enviar",
+        "aprovar",
+        "template",
+        "link",
+        "aguardo",
+        "urgente",
+        "deadline",
+        "please",
+        "can you",
+        "let's schedule",
+        "todo",
+        "action item",
     ]
     like_clauses = " OR ".join(["LOWER(m.content) LIKE ?" for _ in keywords])
     where_clauses.append(f"({like_clauses} OR m.content LIKE '%?')")
@@ -1712,13 +1807,13 @@ def extract_action_items(
 
     where_str = " AND ".join(where_clauses)
     sql = f"""
-        SELECT 
-            m.id, 
-            m.timestamp, 
-            m.sender, 
-            c.name, 
-            c.jid, 
-            m.content, 
+        SELECT
+            m.id,
+            m.timestamp,
+            m.sender,
+            c.name,
+            c.jid,
+            m.content,
             m.is_from_me
         FROM messages m
         JOIN chats c ON m.chat_jid = c.jid
@@ -1734,16 +1829,676 @@ def extract_action_items(
     for r in rows:
         msg_id, ts, sender, c_name, c_jid, content, is_from_me = r
         item_type = "question" if content.strip().endswith("?") else "action_or_commitment"
-        action_items.append({
-            "message_id": msg_id,
-            "timestamp": ts,
-            "chat_jid": c_jid,
-            "chat_name": c_name or c_jid,
-            "sender": sender,
-            "sender_name": get_sender_name(sender) if sender else None,
-            "is_from_me": bool(is_from_me),
-            "type": item_type,
-            "content": content,
-        })
+        action_items.append(
+            {
+                "message_id": msg_id,
+                "timestamp": ts,
+                "chat_jid": c_jid,
+                "chat_name": c_name or c_jid,
+                "sender": sender,
+                "sender_name": get_sender_name(sender) if sender else None,
+                "is_from_me": bool(is_from_me),
+                "type": item_type,
+                "content": content,
+            }
+        )
     return action_items
 
+
+def list_chat_lists() -> list[dict[str, Any]]:
+    """List all WhatsApp labels and custom chat lists with their chat counts.
+
+    Returns:
+        List of chat lists, each with id, name, type, source, and chat_count.
+    """
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        _ensure_chat_list_schema(conn)
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT
+                l.id,
+                l.name,
+                l.type,
+                l.source,
+                COUNT(i.chat_jid) as chat_count
+            FROM chat_lists l
+            LEFT JOIN chat_list_items i ON l.id = i.list_id
+            WHERE l.deleted = 0
+            GROUP BY l.id, l.name, l.type, l.source
+            ORDER BY l.name COLLATE NOCASE ASC
+            """
+        )
+        rows = cursor.fetchall()
+        result = []
+        for r in rows:
+            result.append(
+                {
+                    "id": r[0],
+                    "name": r[1],
+                    "type": r[2] or "CUSTOM",
+                    "source": r[3] or "whatsapp",
+                    "chat_count": r[4],
+                }
+            )
+        return result
+    except sqlite3.Error as e:
+        print(f"Database error in list_chat_lists: {e}")
+        return []
+    finally:
+        if "conn" in locals():
+            conn.close()
+
+
+def list_chats_by_list(
+    list_name: str | None = None,
+    list_id: str | None = None,
+    limit: int = 20,
+    page: int = 0,
+    include_last_message: bool = True,
+    sort_by: str = "last_active",
+) -> list[dict[str, Any]]:
+    """Get chats belonging to a specific WhatsApp label or custom list.
+
+    Args:
+        list_name: Name of the chat list/label (e.g. "Para responder")
+        list_id: ID of the chat list/label
+        limit: Maximum number of chats to return (default: 20)
+        page: Page number for pagination (0-based)
+        include_last_message: Whether to fetch content of the last message
+        sort_by: "last_active" (default) or "name"
+
+    Returns:
+        List of chat dictionaries with the same structure as list_chats.
+    """
+    if not list_name and not list_id:
+        raise ValueError("Either list_name or list_id must be provided")
+
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        _ensure_chat_list_schema(conn)
+        cursor = conn.cursor()
+
+        # Resolve list ID
+        target_list_id = list_id
+        if not target_list_id and list_name:
+            cursor.execute(
+                "SELECT id FROM chat_lists WHERE LOWER(name) = LOWER(?) AND deleted = 0 LIMIT 1",
+                (list_name.strip(),),
+            )
+            row = cursor.fetchone()
+            if not row:
+                # Try partial match if exact match fails
+                cursor.execute(
+                    "SELECT id FROM chat_lists WHERE instr(LOWER(name), LOWER(?)) > 0 AND deleted = 0 LIMIT 1",
+                    (list_name.strip(),),
+                )
+                row = cursor.fetchone()
+            if row:
+                target_list_id = row[0]
+            else:
+                return []
+
+        if include_last_message:
+            last_message_select = "messages.content as last_message, messages.sender as last_sender"
+        else:
+            last_message_select = "NULL as last_message, NULL as last_sender"
+
+        query_parts = [
+            f"""
+            SELECT
+                chats.jid,
+                chats.name,
+                chats.last_message_time,
+                {last_message_select},
+                messages.is_from_me as last_is_from_me,
+                {_last_read_time_select(cursor, "chats")}
+            FROM chats
+            JOIN chat_list_items cli ON chats.jid = cli.chat_jid
+            {_last_message_join("chats", "messages")}
+            WHERE cli.list_id = ?
+            """
+        ]
+
+        order_by = "chats.last_message_time DESC" if sort_by == "last_active" else "chats.name"
+        query_parts.append(f"ORDER BY {order_by}")
+
+        offset = page * limit
+        query_parts.append("LIMIT ? OFFSET ?")
+        params = [target_list_id, limit, offset]
+
+        cursor.execute(" ".join(query_parts), tuple(params))
+        chats = cursor.fetchall()
+
+        result = []
+        for chat_data in chats:
+            chat = Chat(
+                jid=chat_data[0],
+                name=chat_data[1],
+                last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
+                last_message=chat_data[3],
+                last_sender=chat_data[4],
+                last_is_from_me=chat_data[5],
+                last_read_time=datetime.fromisoformat(chat_data[6]) if chat_data[6] else None,
+            )
+            result.append(chat_to_dict(chat))
+
+        return result
+    except sqlite3.Error as e:
+        print(f"Database error in list_chats_by_list: {e}")
+        return []
+    finally:
+        if "conn" in locals():
+            conn.close()
+
+
+def get_chat_lists(chat_jid: str) -> list[dict[str, Any]]:
+    """Get all lists/labels to which a chat belongs.
+
+    Args:
+        chat_jid: WhatsApp JID of the chat
+
+    Returns:
+        List of lists/labels the chat is part of.
+    """
+    if not chat_jid:
+        return []
+
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        _ensure_chat_list_schema(conn)
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT
+                l.id,
+                l.name,
+                l.type,
+                l.source
+            FROM chat_lists l
+            JOIN chat_list_items cli ON l.id = cli.list_id
+            WHERE cli.chat_jid = ? AND l.deleted = 0
+            ORDER BY l.name COLLATE NOCASE ASC
+            """,
+            (chat_jid.strip(),),
+        )
+        rows = cursor.fetchall()
+        result = []
+        for r in rows:
+            result.append(
+                {
+                    "id": r[0],
+                    "name": r[1],
+                    "type": r[2] or "CUSTOM",
+                    "source": r[3] or "whatsapp",
+                }
+            )
+        return result
+    except sqlite3.Error as e:
+        print(f"Database error in get_chat_lists: {e}")
+        return []
+    finally:
+        if "conn" in locals():
+            conn.close()
+
+
+def create_chat_list(name: str) -> dict[str, Any]:
+    """Create a local chat list / tag.
+
+    Args:
+        name: Name of the list (e.g., "Para responder")
+
+    Returns:
+        Dictionary with list id, name, and creation status.
+    """
+    trimmed = name.strip()
+    if not trimmed:
+        raise ValueError("List name cannot be empty")
+
+    now = datetime.now(UTC).isoformat()
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        _ensure_chat_list_schema(conn)
+        cursor = conn.cursor()
+
+        # Check if list with same name already exists
+        cursor.execute(
+            "SELECT id, name, deleted FROM chat_lists WHERE LOWER(name) = LOWER(?) LIMIT 1",
+            (trimmed,),
+        )
+        existing = cursor.fetchone()
+        if existing:
+            list_id, ex_name, deleted = existing
+            if deleted:
+                cursor.execute(
+                    "UPDATE chat_lists SET deleted = 0, updated_at = ? WHERE id = ?",
+                    (now, list_id),
+                )
+                conn.commit()
+                return {
+                    "id": list_id,
+                    "name": ex_name,
+                    "source": "local",
+                    "created": True,
+                    "message": "Reactivated deleted list",
+                }
+            return {
+                "id": list_id,
+                "name": ex_name,
+                "source": "local",
+                "created": False,
+                "message": "List already exists",
+            }
+
+        list_id = str(uuid.uuid4())
+        cursor.execute(
+            """
+            INSERT INTO chat_lists (id, name, color, type, source, deleted, created_at, updated_at)
+            VALUES (?, ?, 0, 'CUSTOM', 'local', 0, ?, ?)
+            """,
+            (list_id, trimmed, now, now),
+        )
+        conn.commit()
+        return {"id": list_id, "name": trimmed, "source": "local", "created": True}
+    except sqlite3.Error as e:
+        print(f"Database error in create_chat_list: {e}")
+        raise
+    finally:
+        if "conn" in locals():
+            conn.close()
+
+
+def add_chat_to_list(list_name: str, chat_jid: str) -> dict[str, Any]:
+    """Add a chat to a list/label.
+
+    Args:
+        list_name: Name or ID of the list
+        chat_jid: WhatsApp JID of the chat
+
+    Returns:
+        Status dictionary
+    """
+    if not list_name or not list_name.strip():
+        raise ValueError("list_name must be provided")
+    if not chat_jid or not chat_jid.strip():
+        raise ValueError("chat_jid must be provided")
+
+    now = datetime.now(UTC).isoformat()
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        _ensure_chat_list_schema(conn)
+        cursor = conn.cursor()
+
+        # Resolve list by name or ID
+        cursor.execute(
+            "SELECT id, name FROM chat_lists WHERE (LOWER(name) = LOWER(?) OR id = ?) AND deleted = 0 LIMIT 1",
+            (list_name.strip(), list_name.strip()),
+        )
+        row = cursor.fetchone()
+        if not row:
+            created = create_chat_list(list_name.strip())
+            list_id = created["id"]
+            resolved_name = list_name.strip()
+        else:
+            list_id, resolved_name = row
+
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO chat_list_items (list_id, chat_jid, created_at)
+            VALUES (?, ?, ?)
+            """,
+            (list_id, chat_jid.strip(), now),
+        )
+        conn.commit()
+        return {
+            "success": True,
+            "list_id": list_id,
+            "list_name": resolved_name,
+            "chat_jid": chat_jid.strip(),
+            "message": f"Added chat {chat_jid.strip()} to list '{resolved_name}'",
+        }
+    except sqlite3.Error as e:
+        print(f"Database error in add_chat_to_list: {e}")
+        raise
+    finally:
+        if "conn" in locals():
+            conn.close()
+
+
+def remove_chat_from_list(list_name: str, chat_jid: str) -> dict[str, Any]:
+    """Remove a chat from a list/label.
+
+    Args:
+        list_name: Name or ID of the list
+        chat_jid: WhatsApp JID of the chat
+
+    Returns:
+        Status dictionary
+    """
+    if not list_name or not list_name.strip():
+        raise ValueError("list_name must be provided")
+    if not chat_jid or not chat_jid.strip():
+        raise ValueError("chat_jid must be provided")
+
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        _ensure_chat_list_schema(conn)
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "SELECT id, name FROM chat_lists WHERE (LOWER(name) = LOWER(?) OR id = ?) AND deleted = 0 LIMIT 1",
+            (list_name.strip(), list_name.strip()),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return {"success": False, "message": f"List '{list_name}' not found"}
+
+        list_id, resolved_name = row
+        cursor.execute(
+            "DELETE FROM chat_list_items WHERE list_id = ? AND chat_jid = ?",
+            (list_id, chat_jid.strip()),
+        )
+        conn.commit()
+        return {
+            "success": True,
+            "list_id": list_id,
+            "list_name": resolved_name,
+            "chat_jid": chat_jid.strip(),
+            "message": f"Removed chat {chat_jid.strip()} from list '{resolved_name}'",
+        }
+    except sqlite3.Error as e:
+        print(f"Database error in remove_chat_from_list: {e}")
+        raise
+    finally:
+        if "conn" in locals():
+            conn.close()
+
+
+def prepare_send_message(
+    chat_jid: str,
+    text: str,
+    reply_to_message_id: str | None = None,
+) -> dict[str, Any]:
+    """Prepare a message draft for two-phase explicit confirmation sending.
+
+    This function NEVER sends anything to WhatsApp. It registers a pending send draft
+    and generates a single-use authorization code that must be explicitly confirmed
+    via `commit_send_message`.
+
+    Args:
+        chat_jid: Target chat JID or phone number (e.g. "12025551234@s.whatsapp.net" or group JID)
+        text: Exact message text to send
+        reply_to_message_id: Optional ID of the message to reply to
+
+    Returns:
+        Dictionary containing send_id, chat_jid, recipient_name, text, text_sha256,
+        expires_at, and authorization_code.
+    """
+    if not chat_jid or not chat_jid.strip():
+        raise ValueError("chat_jid is required")
+    if not text or not text.strip():
+        raise ValueError("text is required")
+
+    chat_jid_clean = chat_jid.strip()
+    if "@" not in chat_jid_clean:
+        chat_jid_clean = f"{chat_jid_clean}@s.whatsapp.net"
+
+    text_clean = text
+    text_hash = hashlib.sha256(text_clean.encode("utf-8")).hexdigest()
+
+    # Generate 4-character random code suffix (excluding ambiguous chars 0, O, 1, I)
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    code_suffix = "".join(random.choices(alphabet, k=4))
+    authorization_code = f"ENVIAR {code_suffix}"
+    code_hash = hashlib.sha256(authorization_code.encode("utf-8")).hexdigest()
+
+    send_id = str(uuid.uuid4())
+    now = datetime.now(UTC)
+    expires_at = now + timedelta(minutes=10)
+
+    # Resolve recipient name
+    recipient_name = get_sender_name(chat_jid_clean)
+
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        _ensure_chat_list_schema(conn)
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            INSERT INTO send_message_audit (
+                send_id, chat_jid, recipient_name, text, text_sha256,
+                reply_to_message_id, authorization_code_hash, status,
+                prepared_at, expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+            """,
+            (
+                send_id,
+                chat_jid_clean,
+                recipient_name,
+                text_clean,
+                text_hash,
+                reply_to_message_id,
+                code_hash,
+                now.isoformat(),
+                expires_at.isoformat(),
+            ),
+        )
+        conn.commit()
+
+        result = {
+            "send_id": send_id,
+            "chat_jid": chat_jid_clean,
+            "recipient_name": recipient_name,
+            "text": text_clean,
+            "text_sha256": text_hash,
+            "expires_at": expires_at.isoformat(),
+            "authorization_code": authorization_code,
+        }
+        if not is_write_enabled():
+            result["warning"] = (
+                "Server write operations are currently disabled (WHATSAPP_WRITE_ENABLED=false). "
+                "commit_send_message will fail until write is enabled in configuration."
+            )
+        return result
+    finally:
+        if "conn" in locals():
+            conn.close()
+
+
+def commit_send_message(
+    send_id: str,
+    authorization_code: str,
+) -> dict[str, Any]:
+    """Execute message delivery after explicit human authorization code verification.
+
+    This is the ONLY function authorized to send messages to WhatsApp.
+    Validates that:
+    1. Server write operations are enabled (WHATSAPP_WRITE_ENABLED=true).
+    2. The draft send_id exists and is in 'pending' status.
+    3. The draft has not expired (10-minute window).
+    4. The authorization code matches exactly.
+    5. The draft text content and SHA-256 hash are intact.
+
+    Args:
+        send_id: Identifier generated by prepare_send_message
+        authorization_code: Confirmation code (e.g. "ENVIAR K7M4")
+
+    Returns:
+        Delivery result dictionary with status and details.
+    """
+    if not is_write_enabled():
+        return {
+            "success": False,
+            "status": "forbidden",
+            "error": (
+                "Write operations are disabled on this WhatsApp MCP server (WHATSAPP_WRITE_ENABLED=false). "
+                "To enable message sending, set WHATSAPP_WRITE_ENABLED=true in the server configuration."
+            ),
+        }
+
+    if not send_id or not send_id.strip():
+        raise ValueError("send_id is required")
+    if not authorization_code or not authorization_code.strip():
+        raise ValueError("authorization_code is required")
+
+    send_id_clean = send_id.strip()
+    code_input = authorization_code.strip().upper()
+    code_hash = hashlib.sha256(code_input.encode("utf-8")).hexdigest()
+    now = datetime.now(UTC)
+
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        _ensure_chat_list_schema(conn)
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT
+                chat_jid, recipient_name, text, text_sha256,
+                reply_to_message_id, authorization_code_hash,
+                status, expires_at
+            FROM send_message_audit
+            WHERE send_id = ?
+            """,
+            (send_id_clean,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return {
+                "success": False,
+                "status": "failed",
+                "error": f"Draft send_id '{send_id_clean}' not found.",
+            }
+
+        (
+            chat_jid,
+            recipient_name,
+            text,
+            stored_text_hash,
+            reply_to_id,
+            stored_code_hash,
+            status,
+            expires_at_str,
+        ) = row
+
+        if status != "pending":
+            return {
+                "success": False,
+                "status": "failed",
+                "error": f"Draft '{send_id_clean}' cannot be used because it is already '{status}'.",
+            }
+
+        expires_at = datetime.fromisoformat(expires_at_str)
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=UTC)
+
+        if now > expires_at:
+            cursor.execute(
+                "UPDATE send_message_audit SET status = 'expired' WHERE send_id = ?",
+                (send_id_clean,),
+            )
+            conn.commit()
+            return {
+                "success": False,
+                "status": "expired",
+                "error": f"Authorization code for send_id '{send_id_clean}' expired at {expires_at_str}.",
+            }
+
+        if code_hash != stored_code_hash:
+            return {
+                "success": False,
+                "status": "unauthorized",
+                "error": "Invalid authorization code. Authorization codes are case-insensitive and formatted as 'ENVIAR XXXX'.",
+            }
+
+        # Check content integrity
+        current_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if current_hash != stored_text_hash:
+            cursor.execute(
+                "UPDATE send_message_audit SET status = 'tampered' WHERE send_id = ?",
+                (send_id_clean,),
+            )
+            conn.commit()
+            return {
+                "success": False,
+                "status": "failed",
+                "error": "Message integrity check failed (SHA-256 mismatch). Send cancelled.",
+            }
+
+        # Dispatch through WhatsApp bridge REST API
+        url = f"{WHATSAPP_API_BASE_URL}/send"
+        payload = {
+            "recipient": chat_jid,
+            "message": text,
+        }
+        if reply_to_id:
+            payload["quoted_message_id"] = reply_to_id
+
+        try:
+            resp = requests.post(
+                url,
+                json=payload,
+                headers=_bridge_headers(),
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                wa_msg_id = data.get("message", "sent")
+                cursor.execute(
+                    """
+                    UPDATE send_message_audit
+                    SET status = 'sent', authorized_at = ?, sent_at = ?, whatsapp_message_id = ?
+                    WHERE send_id = ?
+                    """,
+                    (now.isoformat(), now.isoformat(), wa_msg_id, send_id_clean),
+                )
+                conn.commit()
+                return {
+                    "success": True,
+                    "status": "sent",
+                    "send_id": send_id_clean,
+                    "chat_jid": chat_jid,
+                    "recipient_name": recipient_name,
+                    "whatsapp_message_id": wa_msg_id,
+                    "sent_at": now.isoformat(),
+                }
+            else:
+                err_text = resp.text
+                cursor.execute(
+                    """
+                    UPDATE send_message_audit
+                    SET status = 'failed', authorized_at = ?, error_message = ?
+                    WHERE send_id = ?
+                    """,
+                    (now.isoformat(), f"HTTP {resp.status_code}: {err_text}", send_id_clean),
+                )
+                conn.commit()
+                return {
+                    "success": False,
+                    "status": "failed",
+                    "send_id": send_id_clean,
+                    "error": f"Bridge error HTTP {resp.status_code}: {err_text}",
+                }
+        except Exception as exc:
+            cursor.execute(
+                """
+                UPDATE send_message_audit
+                SET status = 'failed', authorized_at = ?, error_message = ?
+                WHERE send_id = ?
+                """,
+                (now.isoformat(), str(exc), send_id_clean),
+            )
+            conn.commit()
+            return {
+                "success": False,
+                "status": "failed",
+                "send_id": send_id_clean,
+                "error": f"Bridge communication error: {exc}",
+            }
+    finally:
+        if "conn" in locals():
+            conn.close()
