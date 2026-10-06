@@ -347,7 +347,8 @@ func ensureMessageStoreSchema(db *sql.DB) error {
 			created_at TIMESTAMP,
 			updated_at TIMESTAMP
 		);
-		CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_lists_name ON chat_lists(name) WHERE deleted = 0;
+		DROP INDEX IF EXISTS idx_chat_lists_name;
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_lists_name_source ON chat_lists(name, source) WHERE deleted = 0;
 
 		CREATE TABLE IF NOT EXISTS chat_list_items (
 			list_id TEXT NOT NULL,
@@ -1045,17 +1046,34 @@ func (store *MessageStore) StoreLabel(id, name string, color int32, listType str
 	if updatedAt.IsZero() {
 		updatedAt = now
 	}
+
+	// Preserve existing name if incoming name is empty (e.g. partial sync deletion patch)
+	if name == "" {
+		_ = store.db.QueryRow("SELECT name FROM chat_lists WHERE id = ?", id).Scan(&name)
+		if name == "" {
+			name = "Lista " + id
+		}
+	}
+
+	// If a local fallback list exists with the same name, migrate its items to this native list and delete the local list
+	var localID string
+	err := store.db.QueryRow("SELECT id FROM chat_lists WHERE LOWER(name) = LOWER(?) AND source = 'local' AND deleted = 0", name).Scan(&localID)
+	if err == nil && localID != "" && localID != id {
+		_, _ = store.db.Exec("UPDATE OR IGNORE chat_list_items SET list_id = ? WHERE list_id = ?", id, localID)
+		_, _ = store.db.Exec("DELETE FROM chat_lists WHERE id = ?", localID)
+	}
+
 	query := `
 		INSERT INTO chat_lists (id, name, color, type, source, deleted, created_at, updated_at)
 		VALUES (?, ?, ?, ?, 'whatsapp', ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
-			name = excluded.name,
+			name = CASE WHEN excluded.name != '' THEN excluded.name ELSE chat_lists.name END,
 			color = excluded.color,
 			type = excluded.type,
 			deleted = excluded.deleted,
 			updated_at = excluded.updated_at
 	`
-	_, err := store.db.Exec(query, id, name, color, listType, deleted, now, updatedAt)
+	_, err = store.db.Exec(query, id, name, color, listType, deleted, now, updatedAt)
 	return err
 }
 
@@ -1069,6 +1087,18 @@ func (store *MessageStore) StoreChatLabelAssociation(chatJID, labelID string, la
 		_, err := store.db.Exec(`DELETE FROM chat_list_items WHERE list_id = ? AND chat_jid = ?`, labelID, chatJID)
 		return err
 	}
+
+	// Ensure FK targets exist regardless of event delivery order
+	_, _ = store.db.Exec(`
+		INSERT OR IGNORE INTO chat_lists (id, name, color, type, source, deleted, created_at, updated_at)
+		VALUES (?, ?, 0, 'CUSTOM', 'whatsapp', 0, ?, ?)
+	`, labelID, "Lista "+labelID, now, updatedAt)
+
+	_, _ = store.db.Exec(`
+		INSERT OR IGNORE INTO chats (jid, name, last_message_time)
+		VALUES (?, '', ?)
+	`, chatJID, updatedAt)
+
 	query := `
 		INSERT OR IGNORE INTO chat_list_items (list_id, chat_jid, created_at)
 		VALUES (?, ?, ?)
@@ -1922,6 +1952,23 @@ func extractMediaInfo(msg *waProto.Message, msgTimestamp time.Time, msgID string
 	}
 
 	return "", "", "", nil, nil, nil, 0
+}
+
+// maskJID masks identifiers in log messages to avoid logging sensitive contact data.
+func maskJID(jid string) string {
+	if len(jid) <= 8 {
+		return "***"
+	}
+	parts := strings.SplitN(jid, "@", 2)
+	user := parts[0]
+	server := ""
+	if len(parts) > 1 {
+		server = "@" + parts[1]
+	}
+	if len(user) <= 4 {
+		return "***" + server
+	}
+	return user[:3] + "..." + user[len(user)-2:] + server
 }
 
 // resolveLIDChat resolves a LID-based chat JID to its phone-based equivalent
@@ -3089,6 +3136,8 @@ func main() {
 		logger.Errorf("Failed to create WhatsApp client")
 		return
 	}
+	client.EmitAppStateEventsOnFullSync = true
+	client.AppStateDebugLogs = true
 
 	// Initialize message store
 	messageStore, err := NewMessageStore()
@@ -3240,12 +3289,28 @@ func main() {
 				logger.Infof("Call terminated: id=%s reason=%q", v.CallID, v.Reason)
 			}
 
+		case *events.AppState:
+			if len(v.Index) > 0 {
+				maskedParts := make([]string, len(v.Index))
+				for i, part := range v.Index {
+					maskedParts[i] = maskJID(part)
+				}
+				logger.Debugf("AppState mutation: index=%v", maskedParts)
+			}
+
+		case *events.AppStateSyncComplete:
+			logger.Infof("✓ AppState sync complete: collection=%s version=%d (recovery=%v)", v.Name, v.Version, v.Recovery)
+
+		case *events.AppStateSyncError:
+			logger.Warnf("⚠️ AppState sync error: collection=%s (fullSync=%v): %v", v.Name, v.FullSync, v.Error)
+
 		case *events.LabelEdit:
 			if v.Action != nil {
 				labelName := v.Action.GetName()
 				color := v.Action.GetColor()
 				deleted := v.Action.GetDeleted()
 				listType := v.Action.GetType().String()
+				logger.Infof("Received WhatsApp label event: id=%s name=%q type=%s deleted=%v fromFullSync=%v", v.LabelID, labelName, listType, deleted, v.FromFullSync)
 				if err := messageStore.StoreLabel(v.LabelID, labelName, color, listType, deleted, v.Timestamp); err != nil {
 					logger.Warnf("Failed to store label %s (%s): %v", v.LabelID, labelName, err)
 				} else {
@@ -3257,23 +3322,30 @@ func main() {
 			if v.Action != nil {
 				labeled := v.Action.GetLabeled()
 				chatJID := resolveLIDChat(client, v.JID, types.EmptyJID, types.EmptyJID, false).String()
+				logger.Infof("Received chat label association event: chat=%s label=%s labeled=%v fromFullSync=%v", maskJID(chatJID), v.LabelID, labeled, v.FromFullSync)
 				if err := messageStore.StoreChatLabelAssociation(chatJID, v.LabelID, labeled, v.Timestamp); err != nil {
-					logger.Warnf("Failed to store chat label association %s <-> %s: %v", chatJID, v.LabelID, err)
+					logger.Warnf("Failed to store chat label association %s <-> %s: %v", maskJID(chatJID), v.LabelID, err)
 				} else {
-					logger.Infof("Stored chat label association: chat=%s label=%s labeled=%v", chatJID, v.LabelID, labeled)
+					logger.Infof("Stored chat label association: chat=%s label=%s labeled=%v", maskJID(chatJID), v.LabelID, labeled)
 				}
 			}
 
 		case *events.Connected:
 			logger.Infof("✓ Successfully connected to WhatsApp servers")
 			go func() {
-				// Resync AppState regular patches (such as labels/chat filters) in background
-				ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+				// Resync AppState patches (such as labels/chat filters) in background
+				ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 				defer cancel()
-				if err := client.FetchAppState(ctx, appstate.WAPatchRegular, true, false); err != nil {
-					logger.Warnf("Failed to fetch regular app state: %v", err)
-				} else {
-					logger.Infof("✓ Regular app state full sync complete")
+				for _, patch := range []appstate.WAPatchName{
+					appstate.WAPatchRegular,
+					appstate.WAPatchRegularLow,
+					appstate.WAPatchRegularHigh,
+				} {
+					if err := client.FetchAppState(ctx, patch, true, false); err != nil {
+						logger.Warnf("Failed to fetch %s app state: %v", patch, err)
+					} else {
+						logger.Infof("✓ %s app state full sync complete", patch)
+					}
 				}
 			}()
 

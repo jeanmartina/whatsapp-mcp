@@ -70,7 +70,10 @@ def _ensure_chat_list_schema(conn: sqlite3.Connection) -> None:
         );
     """)
     cursor.execute("""
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_lists_name ON chat_lists(name) WHERE deleted = 0;
+        DROP INDEX IF EXISTS idx_chat_lists_name;
+    """)
+    cursor.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_lists_name_source ON chat_lists(name, source) WHERE deleted = 0;
     """)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS chat_list_items (
@@ -1868,12 +1871,17 @@ def list_chat_lists() -> list[dict[str, Any]]:
             LEFT JOIN chat_list_items i ON l.id = i.list_id
             WHERE l.deleted = 0
             GROUP BY l.id, l.name, l.type, l.source
-            ORDER BY l.name COLLATE NOCASE ASC
+            ORDER BY CASE WHEN l.source = 'whatsapp' THEN 0 ELSE 1 END, l.name COLLATE NOCASE ASC
             """
         )
         rows = cursor.fetchall()
+        seen_names = set()
         result = []
         for r in rows:
+            name_lower = (r[1] or "").lower()
+            if name_lower in seen_names:
+                continue
+            seen_names.add(name_lower)
             result.append(
                 {
                     "id": r[0],
@@ -1883,6 +1891,7 @@ def list_chat_lists() -> list[dict[str, Any]]:
                     "chat_count": r[4],
                 }
             )
+        result.sort(key=lambda x: x["name"].lower())
         return result
     except sqlite3.Error as e:
         print(f"Database error in list_chat_lists: {e}")
@@ -1925,14 +1934,24 @@ def list_chats_by_list(
         target_list_id = list_id
         if not target_list_id and list_name:
             cursor.execute(
-                "SELECT id FROM chat_lists WHERE LOWER(name) = LOWER(?) AND deleted = 0 LIMIT 1",
+                """
+                SELECT id FROM chat_lists 
+                WHERE LOWER(name) = LOWER(?) AND deleted = 0 
+                ORDER BY CASE WHEN source = 'whatsapp' THEN 0 ELSE 1 END
+                LIMIT 1
+                """,
                 (list_name.strip(),),
             )
             row = cursor.fetchone()
             if not row:
                 # Try partial match if exact match fails
                 cursor.execute(
-                    "SELECT id FROM chat_lists WHERE instr(LOWER(name), LOWER(?)) > 0 AND deleted = 0 LIMIT 1",
+                    """
+                    SELECT id FROM chat_lists 
+                    WHERE instr(LOWER(name), LOWER(?)) > 0 AND deleted = 0 
+                    ORDER BY CASE WHEN source = 'whatsapp' THEN 0 ELSE 1 END
+                    LIMIT 1
+                    """,
                     (list_name.strip(),),
                 )
                 row = cursor.fetchone()
@@ -2021,7 +2040,7 @@ def get_chat_lists(chat_jid: str) -> list[dict[str, Any]]:
             FROM chat_lists l
             JOIN chat_list_items cli ON l.id = cli.list_id
             WHERE cli.chat_jid = ? AND l.deleted = 0
-            ORDER BY l.name COLLATE NOCASE ASC
+            ORDER BY CASE WHEN l.source = 'whatsapp' THEN 0 ELSE 1 END, l.name COLLATE NOCASE ASC
             """,
             (chat_jid.strip(),),
         )

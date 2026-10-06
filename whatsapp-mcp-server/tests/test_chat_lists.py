@@ -134,3 +134,42 @@ def test_list_chats_by_list(test_db):
     # Query without list_name or list_id raises ValueError
     with pytest.raises(ValueError):
         whatsapp.list_chats_by_list()
+
+
+def test_native_list_precedence_over_local_fallback(test_db):
+    conn = sqlite3.connect(test_db)
+    whatsapp._ensure_chat_list_schema(conn)
+    # Insert chat
+    conn.execute(
+        "INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
+        ("client@s.whatsapp.net", "Cliente VIP", "2026-10-06T12:00:00"),
+    )
+    # Insert both local fallback and native list with same name "Para responder"
+    conn.execute(
+        "INSERT INTO chat_lists (id, name, color, type, source, deleted, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ("local-id-1", "Para responder", 0, "CUSTOM", "local", 0, "2026-10-06T10:00:00", "2026-10-06T10:00:00"),
+    )
+    conn.execute(
+        "INSERT INTO chat_lists (id, name, color, type, source, deleted, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ("native-id-1", "Para responder", 5, "CUSTOM", "whatsapp", 0, "2026-10-06T10:05:00", "2026-10-06T10:05:00"),
+    )
+    # Associate client with native list
+    conn.execute(
+        "INSERT INTO chat_list_items (list_id, chat_jid, created_at) VALUES (?, ?, ?)",
+        ("native-id-1", "client@s.whatsapp.net", "2026-10-06T10:05:00"),
+    )
+    conn.commit()
+    conn.close()
+
+    # list_chat_lists should return the native list, deduplicated
+    lists = whatsapp.list_chat_lists()
+    assert len(lists) == 1
+    assert lists[0]["id"] == "native-id-1"
+    assert lists[0]["source"] == "whatsapp"
+    assert lists[0]["chat_count"] == 1
+
+    # list_chats_by_list should resolve to native list
+    chats = whatsapp.list_chats_by_list(list_name="Para responder")
+    assert len(chats) == 1
+    assert chats[0]["jid"] == "client@s.whatsapp.net"
+    assert chats[0]["name"] == "Cliente VIP"
