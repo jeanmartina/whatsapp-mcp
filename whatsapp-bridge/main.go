@@ -2568,6 +2568,9 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 	// On-demand history sync endpoint (see history_ondemand.go)
 	registerHistoryEndpoint(mux, auth, client, messageStore)
 
+	// Native mark chat read endpoint (see chat_read.go)
+	registerChatReadEndpoint(mux, auth, client, messageStore)
+
 	// Health check endpoint
 	mux.HandleFunc("/api/health", auth(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -3327,6 +3330,20 @@ func main() {
 					logger.Warnf("Failed to store chat label association %s <-> %s: %v", maskJID(chatJID), v.LabelID, err)
 				} else {
 					logger.Infof("Stored chat label association: chat=%s label=%s labeled=%v", maskJID(chatJID), v.LabelID, labeled)
+				}
+			}
+
+		case *events.MarkChatAsRead:
+			if v.Action != nil && v.Action.GetRead() {
+				chatJID := resolveLIDChat(client, v.JID, types.EmptyJID, types.EmptyJID, false).String()
+				readAt := v.Timestamp
+				if mr := v.Action.GetMessageRange(); mr != nil && mr.LastMessageTimestamp != nil && *mr.LastMessageTimestamp > 0 {
+					readAt = time.Unix(*mr.LastMessageTimestamp, 0)
+				}
+				if err := messageStore.MarkChatRead(chatJID, readAt); err != nil {
+					logger.Warnf("Failed to mark chat %s read from appstate sync: %v", maskJID(chatJID), err)
+				} else {
+					logger.Infof("Marked chat %s read from appstate sync event (readAt=%v)", maskJID(chatJID), readAt)
 				}
 			}
 

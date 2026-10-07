@@ -54,6 +54,11 @@ def is_write_enabled() -> bool:
     return os.getenv("WHATSAPP_WRITE_ENABLED", "false").lower() in ("true", "1", "yes")
 
 
+def is_mark_read_enabled() -> bool:
+    """Return whether marking chats as read is enabled."""
+    return os.getenv("WHATSAPP_MARK_READ_ENABLED", "false").lower() in ("true", "1", "yes")
+
+
 def _ensure_chat_list_schema(conn: sqlite3.Connection) -> None:
     """Ensure chat_lists, chat_list_items, and send_message_audit tables exist."""
     cursor = conn.cursor()
@@ -1331,6 +1336,146 @@ def mark_messages_read(
         return False, f"Error parsing response: {response.text}"
     except Exception as e:
         return False, f"Unexpected error: {str(e)}"
+
+
+def mark_chat_read(
+    chat_jid: str,
+    message_id: str | None = None,
+) -> dict[str, Any]:
+    """Mark a WhatsApp chat as read natively.
+
+    Validates feature flag WHATSAPP_MARK_READ_ENABLED=true, checks local existence,
+    and calls the WhatsApp bridge to dispatch read receipts and multi-device app state sync.
+
+    Args:
+        chat_jid: The target chat JID (e.g. '554899999999@s.whatsapp.net' or '120363...@g.us')
+        message_id: Optional ID of a specific message to mark read through.
+
+    Returns:
+        Dictionary with execution result, timestamps, and unread state.
+    """
+    if not is_mark_read_enabled():
+        return {
+            "success": False,
+            "status": "forbidden",
+            "error": "WHATSAPP_MARK_READ_ENABLED=false",
+        }
+
+    chat_jid_clean = (chat_jid or "").strip()
+    if not chat_jid_clean:
+        return {
+            "success": False,
+            "status": "invalid_argument",
+            "error": "chat_jid is required",
+        }
+
+    if "@" not in chat_jid_clean:
+        chat_jid_clean = f"{chat_jid_clean}@s.whatsapp.net"
+
+    chat = get_chat(chat_jid_clean, include_last_message=False)
+    if not chat:
+        return {
+            "success": False,
+            "status": "not_found",
+            "error": f"Chat '{chat_jid_clean}' not found",
+        }
+
+    message_id_clean = (message_id or "").strip() or None
+    if message_id_clean:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT chat_jid FROM messages WHERE id = ?", (message_id_clean,))
+            row = cursor.fetchone()
+            if not row:
+                return {
+                    "success": False,
+                    "status": "not_found",
+                    "error": f"Message '{message_id_clean}' not found",
+                }
+            if row[0] != chat_jid_clean:
+                return {
+                    "success": False,
+                    "status": "invalid_argument",
+                    "error": f"Message '{message_id_clean}' does not belong to chat '{chat_jid_clean}'",
+                }
+        finally:
+            conn.close()
+
+    payload: dict[str, Any] = {"chat_jid": chat_jid_clean}
+    if message_id_clean:
+        payload["message_id"] = message_id_clean
+
+    try:
+        response = requests.post(
+            f"{WHATSAPP_API_BASE_URL}/chats/mark-read",
+            json=payload,
+            headers=_bridge_headers(),
+            timeout=15,
+        )
+        if response.status_code == 200:
+            return response.json()
+
+        try:
+            err_data = response.json()
+            if isinstance(err_data, dict) and "error" in err_data:
+                return err_data
+        except Exception:
+            pass
+
+        status_label = "forbidden" if response.status_code == 403 else "unavailable" if response.status_code == 503 else "failed"
+        return {
+            "success": False,
+            "status": status_label,
+            "error": f"Bridge error HTTP {response.status_code}: {response.text}",
+        }
+    except requests.RequestException as e:
+        return {
+            "success": False,
+            "status": "unavailable",
+            "error": f"WhatsApp bridge unreachable: {e}",
+        }
+
+
+def mark_chats_read(
+    chat_jids: list[str],
+) -> dict[str, Any]:
+    """Mark multiple WhatsApp chats as read in batch (up to 50 chats).
+
+    Args:
+        chat_jids: List of chat JIDs to mark as read.
+
+    Returns:
+        Summary dictionary with overall success, total count, and individual results.
+    """
+    if not is_mark_read_enabled():
+        return {
+            "success": False,
+            "status": "forbidden",
+            "error": "WHATSAPP_MARK_READ_ENABLED=false",
+        }
+
+    if not chat_jids:
+        return {
+            "success": False,
+            "status": "invalid_argument",
+            "error": "chat_jids must not be empty",
+        }
+
+    if len(chat_jids) > 50:
+        return {
+            "success": False,
+            "status": "invalid_argument",
+            "error": "Maximum of 50 chats allowed per batch",
+        }
+
+    results = [mark_chat_read(jid) for jid in chat_jids]
+    all_success = all(r.get("success", False) for r in results)
+    return {
+        "success": all_success,
+        "total": len(chat_jids),
+        "results": results,
+    }
 
 
 def download_media(message_id: str, chat_jid: str) -> str | None:

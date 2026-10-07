@@ -431,6 +431,60 @@ Caveats:
 - **`unread` is a chat-level flag, not an unread count.** WhatsApp's unread
   counter is not persisted.
 
+#### `mark_chat_read`
+
+Mark a WhatsApp conversation as read natively. This tool synchronizes the read marker with WhatsApp's multi-device companion state (`WAPatchRegularLow`), sends read receipts for unread messages up to the chosen position, and updates the local database.
+
+**Security / Feature Flag:**
+Requires `WHATSAPP_MARK_READ_ENABLED=true` in the environment. Marking as read is controlled independently from `WHATSAPP_WRITE_ENABLED` (which governs message sending).
+
+**Parameters:**
+- `chat_jid` (required): Target chat JID or phone number (e.g. `554899999999@s.whatsapp.net` or group `120363012345678901@g.us`).
+- `message_id` (optional): ID of a specific message to mark read through. If omitted, marks through the latest known received inbound message (or latest message).
+
+**Returns:**
+```json
+{
+  "success": true,
+  "chat_jid": "554899999999@s.whatsapp.net",
+  "marked_read_through_message_id": "3AABCDEF01234567",
+  "marked_read_through_timestamp": "2026-10-07T10:05:00+00:00",
+  "previous_last_read_time": "2026-10-07T09:00:00+00:00",
+  "new_last_read_time": "2026-10-07T10:05:00+00:00",
+  "unread": false
+}
+```
+
+**Semantics & Distinction: Read Receipts vs. Marking as Read:**
+- **Marking as Read (Multi-Device App State):** WhatsApp synchronizes conversation read positions across paired devices using companion app state mutations (`BuildMarkChatAsRead` on collection `regular_low`). When this tool executes, it pushes this mutation to WhatsApp servers so that your primary phone and other linked web clients clear their unread badge.
+- **Read Receipts ("Blue Ticks"):** For unread inbound messages up to the read position, the bridge transmits `<receipt>` stanzas. The underlying library (`whatsmeow`) automatically inspects the account's privacy settings: if read receipts are disabled (`PrivacySettingNone`), the receipt is sent as `type="read-self"`, updating your own account state without transmitting blue ticks to the sender. This guarantees account privacy preferences are fully respected.
+- **Group Chats:** When marking a group chat as read, read receipts are routed to each individual participant who authored an unread message, while a single app state patch marks the entire group as read on your devices.
+- **Subsequent Messages:** When new inbound messages arrive in the chat after marking it read, the chat automatically returns to `unread: true` and reappears in `list_unread_chats()`.
+
+**Natural Language Examples:**
+- "Mark the chat with Alice as read"
+- "Mark group 120363012345678901@g.us as read"
+- "Mark chat 554899999999@s.whatsapp.net as read up to message 3AABCDEF01234567"
+
+#### `mark_chats_read`
+
+Mark multiple WhatsApp conversations as read in a single batch (up to 50 chats).
+
+**Parameters:**
+- `chat_jids` (required): Array of chat JIDs to mark as read (maximum 50).
+
+**Returns:**
+```json
+{
+  "success": true,
+  "total": 2,
+  "results": [
+    { "success": true, "chat_jid": "554899999999@s.whatsapp.net", "unread": false },
+    { "success": true, "chat_jid": "554888888888@s.whatsapp.net", "unread": false }
+  ]
+}
+```
+
 #### `list_chats`
 
 List all chats with metadata.

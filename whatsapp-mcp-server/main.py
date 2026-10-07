@@ -71,6 +71,12 @@ from whatsapp import (
     list_unread_chats as whatsapp_list_unread_chats,
 )
 from whatsapp import (
+    mark_chat_read as whatsapp_mark_chat_read,
+)
+from whatsapp import (
+    mark_chats_read as whatsapp_mark_chats_read,
+)
+from whatsapp import (
     prepare_send_message as whatsapp_prepare_send_message,
 )
 from whatsapp import (
@@ -456,6 +462,51 @@ def list_unread_chats(
     return whatsapp_list_unread_chats(
         only_groups=only_groups,
         limit=limit,
+    )
+
+
+@mcp.tool()
+def mark_chat_read(
+    chat_jid: Annotated[str, Field(description="The chat JID to mark as read (e.g. '554899999999@s.whatsapp.net' or group JID)")],
+    message_id: Annotated[str | None, Field(description="Optional ID of a specific message to mark read through")] = None,
+) -> dict[str, Any]:
+    """Mark a WhatsApp conversation as read natively.
+
+    Synchronizes read state with WhatsApp (multi-device app state sync) and sends
+    read receipts for unread messages up to the specified message (or the latest received message).
+    Respects account privacy settings for read receipts.
+
+    Requires WHATSAPP_MARK_READ_ENABLED=true.
+
+    Args:
+        chat_jid: Target chat JID or phone number.
+        message_id: Optional ID of a specific message to mark read through. If omitted, marks through the latest known received message.
+
+    Returns:
+        Status dictionary with chat_jid, read markers, timestamps, and unread flag.
+    """
+    return whatsapp_mark_chat_read(
+        chat_jid=chat_jid,
+        message_id=message_id,
+    )
+
+
+@mcp.tool()
+def mark_chats_read(
+    chat_jids: Annotated[list[str], Field(description="List of chat JIDs to mark as read (up to 50)")],
+) -> dict[str, Any]:
+    """Mark multiple WhatsApp conversations as read in batch (up to 50 chats).
+
+    Requires WHATSAPP_MARK_READ_ENABLED=true.
+
+    Args:
+        chat_jids: List of chat JIDs to mark as read.
+
+    Returns:
+        Summary dictionary with overall success, total count, and individual chat results.
+    """
+    return whatsapp_mark_chats_read(
+        chat_jids=chat_jids,
     )
 
 

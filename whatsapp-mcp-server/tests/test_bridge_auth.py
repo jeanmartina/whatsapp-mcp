@@ -300,3 +300,35 @@ def test_send_message_without_mentions_omits_mentions_field(monkeypatch):
 
     payload = calls[0]["json"]
     assert "mentions" not in payload
+
+
+def test_mark_chat_read_includes_auth_headers(monkeypatch, tmp_path):
+    """mark_chat_read sends Authorization header to /chats/mark-read."""
+    import sqlite3
+
+    db_path = str(tmp_path / "messages.db")
+    monkeypatch.setattr(whatsapp, "MESSAGES_DB_PATH", db_path)
+    monkeypatch.setenv("WHATSAPP_MARK_READ_ENABLED", "true")
+    monkeypatch.setenv("WHATSAPP_BRIDGE_TOKEN", "auth-token-123")
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE chats (jid TEXT PRIMARY KEY, name TEXT, last_message_time TIMESTAMP, last_read_time TIMESTAMP)")
+    conn.execute("CREATE TABLE messages (id TEXT, chat_jid TEXT, sender TEXT, content TEXT, timestamp TIMESTAMP, is_from_me BOOLEAN, media_type TEXT, filename TEXT, url TEXT, media_key BLOB, file_sha256 BLOB, file_enc_sha256 BLOB, file_length INTEGER, deleted_at TIMESTAMP, PRIMARY KEY (id, chat_jid))")
+    conn.execute("INSERT INTO chats (jid, name, last_message_time) VALUES ('12025551234@s.whatsapp.net', 'Test', '2026-10-07 10:00:00')")
+    conn.commit()
+    conn.close()
+
+    calls = []
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        calls.append({"url": url, "json": json, "headers": headers})
+        return DummyResponse(payload={"success": True, "chat_jid": "12025551234@s.whatsapp.net"})
+
+    monkeypatch.setattr(whatsapp.requests, "post", fake_post)
+
+    whatsapp.mark_chat_read("12025551234@s.whatsapp.net")
+
+    assert len(calls) == 1
+    assert calls[0]["url"].endswith("/chats/mark-read")
+    assert calls[0]["headers"] == {"Authorization": "Bearer auth-token-123"}
+
