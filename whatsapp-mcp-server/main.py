@@ -88,6 +88,10 @@ from whatsapp import (
 from whatsapp import (
     search_messages as whatsapp_search_messages,
 )
+from whatsapp import (
+    get_sync_status as whatsapp_get_sync_status,
+    reconcile_database,
+)
 
 # Initialize FastMCP server. Env-var handling is deferred to the __main__ block
 # so importing this module never parses env vars or exits the process.
@@ -807,6 +811,16 @@ def transcribe_audio(message_id: str, chat_jid: str, force: bool = False) -> dic
     }
 
 
+@mcp.tool()
+def get_sync_status() -> dict[str, Any]:
+    """Diagnose WhatsApp bridge, SQLite persistence, and synchronization health.
+
+    Returns connectivity state, latest message and chat timestamps, today's
+    message count, calculated activity lag, and detected sync issues.
+    """
+    return whatsapp_get_sync_status()
+
+
 def shutdown_handler(signum, frame):
     """Handle shutdown signals gracefully to prevent zombie processes."""
     sys.exit(0)
@@ -818,6 +832,9 @@ if __name__ == "__main__":
     # Register signal handlers for clean shutdown
     signal.signal(signal.SIGINT, shutdown_handler)
     signal.signal(signal.SIGTERM, shutdown_handler)
+
+    # Reconcile database on startup
+    reconcile_database()
 
     # Resolve the transport first: host/port are only used (and validated) for the
     # network transports, so a bad WHATSAPP_MCP_PORT can't break a stdio launch.

@@ -53,6 +53,7 @@ async def test_view_media_mcp_uses_png_mime_for_png_bytes_in_generated_jpg(tmp_p
     assert base64.b64decode(content.data) == png_bytes
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("max_dimension", [True, "1024", 1.5])
 async def test_view_media_mcp_rejects_coerced_dimensions_before_download(monkeypatch, max_dimension):
     download_calls = 0

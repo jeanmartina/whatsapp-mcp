@@ -311,7 +311,10 @@ func ensureMessageStoreSchema(db *sql.DB) error {
 		return fmt.Errorf("failed to ensure messages.quoted_message_id column: %w", err)
 	}
 
-	// Ensure SQLite FTS5 virtual table and synchronization triggers exist if supported
+	// Ensure SQLite FTS5 virtual table and synchronization triggers exist.
+	// FTS5 is strictly required because full-text search and the message sync triggers depend on it.
+	// If the binary was built without `-tags fts5`, fail immediately at startup with an actionable
+	// error rather than silently suppressing it and breaking message insertion later.
 	_, err := db.Exec(`
 		CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
 			content,
@@ -330,8 +333,17 @@ func ensureMessageStoreSchema(db *sql.DB) error {
 		END;
 	`)
 	if err != nil {
-		if !strings.Contains(strings.ToLower(err.Error()), "fts5") && !strings.Contains(strings.ToLower(err.Error()), "no such module") {
-			return fmt.Errorf("failed to ensure messages_fts virtual table and triggers: %w", err)
+		if strings.Contains(strings.ToLower(err.Error()), "fts5") || strings.Contains(strings.ToLower(err.Error()), "no such module") {
+			return fmt.Errorf("FATAL: SQLite FTS5 module is not compiled into this binary. Please rebuild whatsapp-bridge with -tags 'fts5' (underlying error: %w)", err)
+		}
+		return fmt.Errorf("failed to ensure messages_fts virtual table and triggers: %w", err)
+	}
+
+	// Verify FTS5 is genuinely functional with a test probe
+	var ftsProbe int
+	if err := db.QueryRow("SELECT 1 FROM messages_fts LIMIT 1").Scan(&ftsProbe); err != nil && err != sql.ErrNoRows {
+		if strings.Contains(strings.ToLower(err.Error()), "fts5") || strings.Contains(strings.ToLower(err.Error()), "no such module") {
+			return fmt.Errorf("FATAL: SQLite FTS5 probe failed. Rebuild whatsapp-bridge with -tags 'fts5' (error: %w)", err)
 		}
 	}
 
@@ -1304,8 +1316,9 @@ func extractTextContent(msg *waProto.Message) string {
 
 // SendMessageResponse represents the response for the send message API
 type SendMessageResponse struct {
-	Success bool   `json:"success"`
-	Message string `json:"message"`
+	Success   bool   `json:"success"`
+	Message   string `json:"message"`
+	MessageID string `json:"message_id,omitempty"`
 }
 
 // SendMessageRequest represents the request body for the send message API
@@ -1591,9 +1604,9 @@ func resolveMentionJIDs(client *whatsmeow.Client, mentions []string) []string {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string, quotedMsgID string, quotedSenderJID string, quotedContent string, mentions []string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string, quotedMsgID string, quotedSenderJID string, quotedContent string, mentions []string) (bool, string, string) {
 	if !client.IsConnected() {
-		return false, "Not connected to WhatsApp"
+		return false, "Not connected to WhatsApp", ""
 	}
 
 	mentionedJIDs := resolveMentionJIDs(client, mentions)
@@ -1604,7 +1617,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 	if strings.Contains(recipient, "@") {
 		settingsLookupJID, err = types.ParseJID(recipient)
 		if err != nil {
-			return false, fmt.Sprintf("Error parsing JID: %v", err)
+			return false, fmt.Sprintf("Error parsing JID: %v", err), ""
 		}
 	} else {
 		settingsLookupJID = types.JID{
@@ -1621,7 +1634,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 
 	recipientJID, err := resolveRecipientJID(client, recipient)
 	if err != nil {
-		return false, err.Error()
+		return false, err.Error(), ""
 	}
 
 	msg := &waProto.Message{}
@@ -1635,7 +1648,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		// Read media file
 		mediaData, err := os.ReadFile(mediaPath)
 		if err != nil {
-			return false, fmt.Sprintf("Error reading media file: %v", err)
+			return false, fmt.Sprintf("Error reading media file: %v", err), ""
 		}
 
 		mediaType, mimeType, _ := classifyMediaPath(mediaPath)
@@ -1643,7 +1656,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		// Upload media to WhatsApp servers
 		upload, err = client.Upload(context.Background(), mediaData, mediaType)
 		if err != nil {
-			return false, fmt.Sprintf("Error uploading media: %v", err)
+			return false, fmt.Sprintf("Error uploading media: %v", err), ""
 		}
 
 		// Don't log the struct itself — UploadResponse carries the MediaKey
@@ -1686,7 +1699,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 					seconds = analyzedSeconds
 					waveform = analyzedWaveform
 				} else {
-					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err)
+					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err), ""
 				}
 			} else {
 				fmt.Printf("Not an Ogg Opus file: %s\n", mimeType)
@@ -1736,7 +1749,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 			// Unreachable today (classifyMediaPath only returns the four
 			// types above), but fail loudly rather than send an empty proto
 			// while still persisting media metadata for it.
-			return false, fmt.Sprintf("Unsupported media type for %s", mediaPath)
+			return false, fmt.Sprintf("Unsupported media type for %s", mediaPath), ""
 		}
 	} else if quotedMsgID != "" || len(mentionedJIDs) > 0 {
 		// Quoted reply and/or mentions: use ExtendedTextMessage so we can
@@ -1777,7 +1790,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 	// recipient would silently miss the disappearing-message settings row.
 	settings, err := messageStore.GetChatEphemeralSettings(resolveUserJID(client, settingsLookupJID, types.EmptyJID).String())
 	if err != nil && err != sql.ErrNoRows {
-		return false, fmt.Sprintf("Error loading chat settings: %v", err)
+		return false, fmt.Sprintf("Error loading chat settings: %v", err), ""
 	}
 	if err == nil {
 		applyChatEphemeralSettings(msg, settings)
@@ -1787,7 +1800,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 	resp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
-		return false, fmt.Sprintf("Error sending message: %v", err)
+		return false, fmt.Sprintf("Error sending message: %v", err), ""
 	}
 
 	// whatsmeow does not re-emit events.Message for messages this client
@@ -1823,7 +1836,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		}
 	}
 
-	return true, fmt.Sprintf("Message sent to %s", recipient)
+	return true, fmt.Sprintf("Message sent to %s", recipient), resp.ID
 }
 
 // Extract quoted message info from ContextInfo
@@ -2642,8 +2655,8 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 			req.Recipient, len(req.Message), resolvedMediaPath != "")
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, resolvedMediaPath, req.QuotedMessageID, req.QuotedSenderJID, req.QuotedContent, req.Mentions)
-		fmt.Printf("← /api/send success=%v status=%q\n", success, message)
+		success, message, messageID := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, resolvedMediaPath, req.QuotedMessageID, req.QuotedSenderJID, req.QuotedContent, req.Mentions)
+		fmt.Printf("← /api/send success=%v status=%q message_id=%q\n", success, message, messageID)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
 
@@ -2654,8 +2667,9 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 
 		// Send response
 		_ = json.NewEncoder(w).Encode(SendMessageResponse{
-			Success: success,
-			Message: message,
+			Success:   success,
+			Message:   message,
+			MessageID: messageID,
 		})
 	}))
 

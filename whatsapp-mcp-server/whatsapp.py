@@ -59,6 +59,31 @@ def is_mark_read_enabled() -> bool:
     return os.getenv("WHATSAPP_MARK_READ_ENABLED", "false").lower() in ("true", "1", "yes")
 
 
+def _normalize_query_datetime(val: str | datetime | None) -> str | None:
+    """Normalize datetime strings or objects to SQLite format 'YYYY-MM-DD HH:MM:SS+ZZ:ZZ'.
+
+    The Go bridge stores SQLite timestamps using space separator (e.g. '2026-10-08 14:46:32-03:00').
+    Standard ISO-8601 strings with 'T' (e.g. '2026-10-08T00:00:00-03:00') evaluate as strictly greater
+    than space-separated timestamps on the same calendar day in SQLite string comparisons because
+    ASCII ' ' (32) < 'T' (84).
+    """
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return val.isoformat(sep=" ")
+    s = str(val).strip()
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s)
+        return dt.isoformat(sep=" ")
+    except ValueError:
+        if "T" in s:
+            return s.replace("T", " ")
+        return s
+
+
+
 def _ensure_chat_list_schema(conn: sqlite3.Connection) -> None:
     """Ensure chat_lists, chat_list_items, and send_message_audit tables exist."""
     cursor = conn.cursor()
@@ -147,6 +172,8 @@ class Chat:
     # chat, from read receipts and history-sync backfill. NULL when the
     # bridge has never seen a read for the chat, or predates the column.
     last_read_time: datetime | None = None
+    last_media_type: str | None = None
+    message_available: bool = False
 
     @property
     def is_group(self) -> bool:
@@ -237,6 +264,8 @@ def chat_to_dict(chat: "Chat") -> dict[str, Any]:
         "last_message": chat.last_message,
         "last_sender": chat.last_sender,
         "last_is_from_me": chat.last_is_from_me,
+        "last_media_type": chat.last_media_type,
+        "message_available": chat.message_available,
         "last_read_time": chat.last_read_time.isoformat() if chat.last_read_time else None,
         "unread": chat.unread,
     }
@@ -254,27 +283,40 @@ def _last_read_time_select(cursor: sqlite3.Cursor, table_alias: str) -> str:
     written by an older bridge doesn't have it yet. Reads must keep working
     against such a store — those chats simply report last_read_time = None.
     """
-    columns = {row[1] for row in cursor.execute("PRAGMA table_info(chats)").fetchall()}
-    return f"{table_alias}.last_read_time" if "last_read_time" in columns else "NULL"
+    try:
+        columns = {row[1] for row in cursor.execute("PRAGMA table_info(chats)").fetchall()}
+        return f"{table_alias}.last_read_time" if "last_read_time" in columns else "NULL"
+    except sqlite3.Error:
+        return "NULL"
+
+
+def _media_type_select(cursor: sqlite3.Cursor, table_alias: str) -> str:
+    """SELECT expression for messages.media_type, or a NULL literal."""
+    try:
+        columns = {row[1] for row in cursor.execute("PRAGMA table_info(messages)").fetchall()}
+        return f"{table_alias}.media_type" if "media_type" in columns else "NULL"
+    except sqlite3.Error:
+        return "NULL"
 
 
 def _last_message_join(chat_alias: str, msg_alias: str) -> str:
-    """Deterministic single-row join to the chat's latest message.
+    """Deterministic single-row join to the chat's latest persisted message.
 
-    Multiple messages can share last_message_time (history sync is second-
-    resolution). Joining solely on timestamp would duplicate chat rows and
-    make last_is_from_me / unread non-deterministic; pick one id as tie-break.
+    Joins the most recent persisted message for the chat ordered by timestamp
+    and id, ensuring that even if chats.last_message_time was advanced by an
+    ephemeral/protocol event, reaction, or historical ingestion gap, the latest
+    actual message content, sender, and direction are still exposed.
     """
     return f"""
             LEFT JOIN messages {msg_alias} ON {chat_alias}.jid = {msg_alias}.chat_jid
                 AND {msg_alias}.id = (
                     SELECT m.id FROM messages m
                     WHERE m.chat_jid = {chat_alias}.jid
-                      AND m.timestamp = {chat_alias}.last_message_time
-                    ORDER BY m.id DESC
+                    ORDER BY m.timestamp DESC, m.id DESC
                     LIMIT 1
                 )
     """
+
 
 
 def _sender_aliases(value: str) -> list[str]:
@@ -527,21 +569,21 @@ def list_messages(
         # Add filters
         if after:
             try:
-                after = datetime.fromisoformat(after)
+                after_norm = _normalize_query_datetime(after)
             except ValueError:
                 raise ValueError(f"Invalid date format for 'after': {after}. Please use ISO-8601 format.")
 
             where_clauses.append("messages.timestamp > ?")
-            params.append(after)
+            params.append(after_norm)
 
         if before:
             try:
-                before = datetime.fromisoformat(before)
+                before_norm = _normalize_query_datetime(before)
             except ValueError:
                 raise ValueError(f"Invalid date format for 'before': {before}. Please use ISO-8601 format.")
 
             where_clauses.append("messages.timestamp < ?")
-            params.append(before)
+            params.append(before_norm)
 
         if sender_phone_number:
             aliases = _sender_aliases(sender_phone_number)
@@ -745,8 +787,10 @@ def list_chats(
         # constant across the branch.
         if include_last_message:
             last_message_select = "messages.content as last_message, messages.sender as last_sender"
+            last_media_type_select = f"{_media_type_select(cursor, 'messages')} as last_media_type"
         else:
             last_message_select = "NULL as last_message, NULL as last_sender"
+            last_media_type_select = "NULL as last_media_type"
 
         query_parts = [
             f"""
@@ -756,7 +800,9 @@ def list_chats(
                 chats.last_message_time,
                 {last_message_select},
                 messages.is_from_me as last_is_from_me,
-                {_last_read_time_select(cursor, "chats")}
+                {_last_read_time_select(cursor, "chats")},
+                {last_media_type_select},
+                (messages.id IS NOT NULL) as message_available
             FROM chats
             {_last_message_join("chats", "messages")}
         """
@@ -797,6 +843,8 @@ def list_chats(
                 last_sender=chat_data[4],
                 last_is_from_me=chat_data[5],
                 last_read_time=datetime.fromisoformat(chat_data[6]) if chat_data[6] else None,
+                last_media_type=chat_data[7],
+                message_available=bool(chat_data[8]),
             )
             result.append(chat_to_dict(chat))
 
@@ -906,7 +954,9 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> list[dict[str
                 last_msg.content as last_message,
                 last_msg.sender as last_sender,
                 last_msg.is_from_me as last_is_from_me,
-                {_last_read_time_select(cursor, "c")}
+                {_last_read_time_select(cursor, "c")},
+                {_media_type_select(cursor, "last_msg")} as last_media_type,
+                (last_msg.id IS NOT NULL) as message_available
             FROM chats c
             {_last_message_join("c", "last_msg")}
             WHERE EXISTS (
@@ -933,6 +983,8 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> list[dict[str
                 last_sender=chat_data[4],
                 last_is_from_me=chat_data[5],
                 last_read_time=datetime.fromisoformat(chat_data[6]) if chat_data[6] else None,
+                last_media_type=chat_data[7],
+                message_available=bool(chat_data[8]),
             )
             result.append(chat_to_dict(chat))
 
@@ -1021,8 +1073,10 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> dict[str, Any]
         # and the result tuple shape stays stable across the branch.
         if include_last_message:
             last_message_select = "m.content as last_message, m.sender as last_sender"
+            last_media_type_select = f"{_media_type_select(cursor, 'm')} as last_media_type"
         else:
             last_message_select = "NULL as last_message, NULL as last_sender"
+            last_media_type_select = "NULL as last_media_type"
 
         query = f"""
             SELECT
@@ -1031,7 +1085,9 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> dict[str, Any]
                 c.last_message_time,
                 {last_message_select},
                 m.is_from_me as last_is_from_me,
-                {_last_read_time_select(cursor, "c")}
+                {_last_read_time_select(cursor, "c")},
+                {last_media_type_select},
+                (m.id IS NOT NULL) as message_available
             FROM chats c
             {_last_message_join("c", "m")}
             WHERE c.jid = ?
@@ -1051,6 +1107,8 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> dict[str, Any]
             last_sender=chat_data[4],
             last_is_from_me=chat_data[5],
             last_read_time=datetime.fromisoformat(chat_data[6]) if chat_data[6] else None,
+            last_media_type=chat_data[7],
+            message_available=bool(chat_data[8]),
         )
         return chat_to_dict(chat)
 
@@ -1077,7 +1135,9 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> dict[str, Any] | Non
                 m.content as last_message,
                 m.sender as last_sender,
                 m.is_from_me as last_is_from_me,
-                {_last_read_time_select(cursor, "c")}
+                {_last_read_time_select(cursor, "c")},
+                {_media_type_select(cursor, "m")} as last_media_type,
+                (m.id IS NOT NULL) as message_available
             FROM chats c
             {_last_message_join("c", "m")}
             WHERE c.jid LIKE ? AND c.jid NOT LIKE '%@g.us'
@@ -1099,6 +1159,8 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> dict[str, Any] | Non
             last_sender=chat_data[4],
             last_is_from_me=chat_data[5],
             last_read_time=datetime.fromisoformat(chat_data[6]) if chat_data[6] else None,
+            last_media_type=chat_data[7],
+            message_available=bool(chat_data[8]),
         )
         return chat_to_dict(chat)
 
@@ -1519,42 +1581,42 @@ def download_media(message_id: str, chat_jid: str) -> str | None:
 
 
 def parse_timeframe(timeframe: str | None) -> tuple[str | None, str | None]:
-    """Parse natural or ISO timeframes into (after, before) ISO strings."""
+    """Parse natural or ISO timeframes into (after, before) normalized strings."""
     if not timeframe:
         return None, None
     tf = timeframe.strip().lower()
     now = datetime.now().astimezone()
     if tf == "today":
         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        return start.isoformat(), None
+        return start.isoformat(sep=" "), None
     elif tf == "yesterday":
         start = (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         end = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        return start.isoformat(), end.isoformat()
+        return start.isoformat(sep=" "), end.isoformat(sep=" ")
     elif tf in ("last_24_hours", "24h"):
         start = now - timedelta(hours=24)
-        return start.isoformat(), None
+        return start.isoformat(sep=" "), None
     elif tf in ("last_3_days", "3d"):
         start = now - timedelta(days=3)
-        return start.isoformat(), None
+        return start.isoformat(sep=" "), None
     elif tf == "this_week":
         start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
-        return start.isoformat(), None
+        return start.isoformat(sep=" "), None
     elif tf in ("last_7_days", "7d", "last_week"):
         start = now - timedelta(days=7)
-        return start.isoformat(), None
+        return start.isoformat(sep=" "), None
     elif tf in ("last_30_days", "30d", "this_month"):
         start = now - timedelta(days=30)
-        return start.isoformat(), None
+        return start.isoformat(sep=" "), None
     elif tf in ("last_6_months", "6m"):
         start = now - timedelta(days=180)
-        return start.isoformat(), None
+        return start.isoformat(sep=" "), None
     elif tf in ("last_year", "1y"):
         start = now - timedelta(days=365)
-        return start.isoformat(), None
+        return start.isoformat(sep=" "), None
     try:
         dt = datetime.fromisoformat(timeframe)
-        return dt.isoformat(), None
+        return dt.isoformat(sep=" "), None
     except ValueError:
         return None, None
 
@@ -1578,6 +1640,9 @@ def search_messages(
         tf_after, tf_before = parse_timeframe(timeframe)
         after = after or tf_after
         before = before or tf_before
+
+    after = _normalize_query_datetime(after)
+    before = _normalize_query_datetime(before)
 
     conn = sqlite3.connect(MESSAGES_DB_PATH)
     cursor = conn.cursor()
@@ -1707,6 +1772,8 @@ def catch_up(
     after, before = parse_timeframe(timeframe)
     if not after:
         after, _ = parse_timeframe("today")
+    after = _normalize_query_datetime(after)
+    before = _normalize_query_datetime(before)
 
     conn = sqlite3.connect(MESSAGES_DB_PATH)
     cursor = conn.cursor()
@@ -1907,6 +1974,8 @@ def extract_action_items(
     after, before = parse_timeframe(timeframe)
     if not after:
         after, _ = parse_timeframe("last_7_days")
+    after = _normalize_query_datetime(after)
+    before = _normalize_query_datetime(before)
 
     conn = sqlite3.connect(MESSAGES_DB_PATH)
     cursor = conn.cursor()
@@ -2107,8 +2176,10 @@ def list_chats_by_list(
 
         if include_last_message:
             last_message_select = "messages.content as last_message, messages.sender as last_sender"
+            last_media_type_select = f"{_media_type_select(cursor, 'messages')} as last_media_type"
         else:
             last_message_select = "NULL as last_message, NULL as last_sender"
+            last_media_type_select = "NULL as last_media_type"
 
         query_parts = [
             f"""
@@ -2118,7 +2189,9 @@ def list_chats_by_list(
                 chats.last_message_time,
                 {last_message_select},
                 messages.is_from_me as last_is_from_me,
-                {_last_read_time_select(cursor, "chats")}
+                {_last_read_time_select(cursor, "chats")},
+                {last_media_type_select},
+                (messages.id IS NOT NULL) as message_available
             FROM chats
             JOIN chat_list_items cli ON chats.jid = cli.chat_jid
             {_last_message_join("chats", "messages")}
@@ -2146,6 +2219,8 @@ def list_chats_by_list(
                 last_sender=chat_data[4],
                 last_is_from_me=chat_data[5],
                 last_read_time=datetime.fromisoformat(chat_data[6]) if chat_data[6] else None,
+                last_media_type=chat_data[7],
+                message_available=bool(chat_data[8]),
             )
             result.append(chat_to_dict(chat))
 
@@ -2611,15 +2686,36 @@ def commit_send_message(
             )
             if resp.status_code == 200:
                 data = resp.json()
-                wa_msg_id = data.get("message", "sent")
+                wa_msg_id = data.get("message_id") or data.get("message", "sent")
+                now_str = now.astimezone().isoformat(sep=" ")
                 cursor.execute(
                     """
                     UPDATE send_message_audit
                     SET status = 'sent', authorized_at = ?, sent_at = ?, whatsapp_message_id = ?
                     WHERE send_id = ?
                     """,
-                    (now.isoformat(), now.isoformat(), wa_msg_id, send_id_clean),
+                    (now_str, now_str, wa_msg_id, send_id_clean),
                 )
+                if wa_msg_id and not wa_msg_id.startswith("Message sent"):
+                    try:
+                        cursor.execute(
+                            """
+                            INSERT OR IGNORE INTO messages
+                            (id, chat_jid, sender, content, timestamp, is_from_me, quoted_message_id)
+                            VALUES (?, ?, 'Me', ?, ?, 1, ?)
+                            """,
+                            (wa_msg_id, chat_jid, text, now_str, reply_to_id),
+                        )
+                        cursor.execute(
+                            """
+                            UPDATE chats
+                            SET last_message_time = ?
+                            WHERE jid = ? AND (last_message_time IS NULL OR last_message_time < ?)
+                            """,
+                            (now_str, chat_jid, now_str),
+                        )
+                    except sqlite3.OperationalError:
+                        pass
                 conn.commit()
                 return {
                     "success": True,
@@ -2666,3 +2762,173 @@ def commit_send_message(
     finally:
         if "conn" in locals():
             conn.close()
+
+
+def reconcile_database(conn: sqlite3.Connection | None = None) -> dict[str, int]:
+    """Reconcile inconsistencies between chats and messages tables.
+
+    1. If any messages are newer than the corresponding chat's last_message_time,
+       update chats.last_message_time to the latest message timestamp.
+    2. Reconcile confirmed sent messages from send_message_audit into messages.
+    3. Ensure index idx_messages_chat_jid_timestamp exists.
+    """
+    should_close = False
+    if conn is None:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        should_close = True
+    try:
+        cursor = conn.cursor()
+        _ensure_chat_list_schema(conn)
+
+        # 1. Update chats where messages have newer timestamp
+        cursor.execute("""
+            UPDATE chats
+            SET last_message_time = (
+                SELECT MAX(m.timestamp)
+                FROM messages m
+                WHERE m.chat_jid = chats.jid
+            )
+            WHERE EXISTS (
+                SELECT 1
+                FROM messages m
+                WHERE m.chat_jid = chats.jid
+                GROUP BY m.chat_jid
+                HAVING MAX(m.timestamp) > chats.last_message_time
+            )
+        """)
+        updated_chats = cursor.rowcount
+
+        # 2. Reconcile sent messages from audit
+        reconciled_audit = 0
+        cursor.execute("""
+            SELECT send_id, chat_jid, text, sent_at, prepared_at, whatsapp_message_id, reply_to_message_id
+            FROM send_message_audit
+            WHERE status = 'sent' AND whatsapp_message_id IS NOT NULL
+        """)
+        audit_rows = cursor.fetchall()
+        for send_id, chat_jid, text, sent_at, prepared_at, wa_msg_id, reply_to in audit_rows:
+            if not wa_msg_id or wa_msg_id.startswith("Message sent"):
+                continue
+            cursor.execute("SELECT 1 FROM messages WHERE id = ? AND chat_jid = ?", (wa_msg_id, chat_jid))
+            if cursor.fetchone() is None:
+                ts = sent_at or prepared_at or datetime.now().astimezone().isoformat(sep=" ")
+                cursor.execute("""
+                    INSERT OR IGNORE INTO messages
+                    (id, chat_jid, sender, content, timestamp, is_from_me, media_type, quoted_message_id)
+                    VALUES (?, ?, 'Me', ?, ?, 1, NULL, ?)
+                """, (wa_msg_id, chat_jid, text, ts, reply_to))
+                cursor.execute("""
+                    UPDATE chats
+                    SET last_message_time = ?
+                    WHERE jid = ? AND (last_message_time IS NULL OR last_message_time < ?)
+                """, (ts, chat_jid, ts))
+                reconciled_audit += 1
+
+        # 3. Create index for performance
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_messages_chat_jid_timestamp
+            ON messages(chat_jid, timestamp DESC)
+        """)
+
+        conn.commit()
+        return {"updated_chats": updated_chats, "reconciled_audit": reconciled_audit}
+    except Exception as e:
+        print(f"Error in reconcile_database: {e}")
+        return {"updated_chats": 0, "reconciled_audit": 0}
+    finally:
+        if should_close:
+            conn.close()
+
+
+def get_sync_status() -> dict[str, Any]:
+    """Diagnostic tool to inspect WhatsApp bridge, database persistence, and synchronization status.
+
+    Returns:
+        Dictionary containing bridge connectivity, database access, latest message timestamp,
+        latest chat activity timestamp, today's message count, estimated lag, pending audit items,
+        and detected inconsistencies.
+    """
+    status: dict[str, Any] = {
+        "bridge_connected": False,
+        "bridge_status": "unreachable",
+        "database_accessible": False,
+        "latest_persisted_message_time": None,
+        "latest_chat_active_time": None,
+        "today_messages_count": 0,
+        "activity_lag_seconds": None,
+        "audit_pending_count": 0,
+        "inconsistencies": [],
+    }
+
+    # 1. Check bridge health
+    try:
+        resp = requests.get(
+            f"{WHATSAPP_API_BASE_URL}/health",
+            headers=_bridge_headers(),
+            timeout=5,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            status["bridge_connected"] = bool(data.get("connected", False))
+            status["bridge_status"] = data.get("status", "ok")
+        else:
+            status["bridge_status"] = f"http_{resp.status_code}"
+            status["inconsistencies"].append(f"Bridge returned HTTP {resp.status_code}")
+    except Exception as e:
+        status["bridge_status"] = "unreachable"
+        status["inconsistencies"].append(f"Bridge unreachable: {str(e)}")
+
+    if not status["bridge_connected"]:
+        status["inconsistencies"].append("WhatsApp bridge is not connected to WhatsApp network")
+
+    # 2. Check database
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        status["database_accessible"] = True
+        cursor = conn.cursor()
+
+        # Latest message timestamp
+        cursor.execute("SELECT MAX(timestamp) FROM messages")
+        latest_msg_row = cursor.fetchone()
+        latest_msg_ts = latest_msg_row[0] if latest_msg_row else None
+        status["latest_persisted_message_time"] = latest_msg_ts
+
+        # Latest chat activity timestamp
+        cursor.execute("SELECT MAX(last_message_time) FROM chats")
+        latest_chat_row = cursor.fetchone()
+        latest_chat_ts = latest_chat_row[0] if latest_chat_row else None
+        status["latest_chat_active_time"] = latest_chat_ts
+
+        # Today's messages count
+        today_start = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0).isoformat(sep=" ")
+        cursor.execute("SELECT COUNT(*) FROM messages WHERE timestamp >= ?", (today_start,))
+        today_count = cursor.fetchone()[0]
+        status["today_messages_count"] = today_count
+
+        # Pending send audit
+        try:
+            cursor.execute("SELECT COUNT(*) FROM send_message_audit WHERE status = 'pending'")
+            status["audit_pending_count"] = cursor.fetchone()[0]
+        except sqlite3.OperationalError:
+            pass
+
+        # Calculate lag between latest chat active time and latest persisted message
+        if latest_chat_ts and latest_msg_ts:
+            try:
+                dt_chat = datetime.fromisoformat(latest_chat_ts)
+                dt_msg = datetime.fromisoformat(latest_msg_ts)
+                diff = (dt_chat - dt_msg).total_seconds()
+                status["activity_lag_seconds"] = diff
+                if diff > 300:
+                    status["inconsistencies"].append(
+                        f"Chat activity is ahead of latest persisted message by {int(diff)}s (possible ingestion gap or non-message event)"
+                    )
+            except Exception:
+                pass
+        conn.close()
+    except Exception as e:
+        status["database_accessible"] = False
+        status["inconsistencies"].append(f"Database error: {str(e)}")
+
+    return status
+
