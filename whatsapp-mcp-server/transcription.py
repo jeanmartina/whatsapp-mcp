@@ -10,7 +10,9 @@ Whisper runs locally by default. The optional OpenAI-compatible provider sends
 audio only to the endpoint explicitly configured by the operator.
 """
 
+import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -91,13 +93,60 @@ def configured_model(provider: str) -> str:
     return model
 
 
+def select_model(provider: str, requested: str | None = None) -> str:
+    """Resolve a tool-supplied model alias against an operator-owned allowlist.
+
+    Never treat tool input as a filesystem path, URL, or arbitrary provider ID.
+    This keeps model selection possible for MCP clients without granting them
+    authority over files or external services.
+    """
+    if requested is None:
+        return configured_model(provider)
+    if not isinstance(requested, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", requested):
+        raise TranscriptionError("model must be a configured alias (letters, digits, '.', '_' or '-')")
+    raw = os.getenv("WHATSAPP_TRANSCRIPTION_MODEL_MAP", "{}").strip() or "{}"
+    try:
+        aliases = json.loads(raw)
+    except ValueError:
+        raise TranscriptionError("WHATSAPP_TRANSCRIPTION_MODEL_MAP must be a JSON object") from None
+    if not isinstance(aliases, dict):
+        raise TranscriptionError("WHATSAPP_TRANSCRIPTION_MODEL_MAP must be a JSON object")
+    selected = aliases.get(requested)
+    if not isinstance(selected, str) or not selected.strip():
+        raise TranscriptionError(f"Model alias '{requested}' is not configured in WHATSAPP_TRANSCRIPTION_MODEL_MAP")
+    selected = selected.strip()
+    if provider == "whisper_cpp":
+        path = os.path.expanduser(selected)
+        if not os.path.isfile(path):
+            raise TranscriptionError(f"Configured model alias '{requested}' does not point to an installed file")
+        return path
+    return selected
+
+
+def select_language(provider: str, requested: str | None = None) -> str:
+    """Resolve a language as auto-detect or an ISO 639-1 two-letter code."""
+    default = language() if provider == "whisper_cpp" else os.getenv("WHATSAPP_TRANSCRIPTION_LANGUAGE", "auto")
+    value = default if requested is None else requested
+    if not isinstance(value, str):
+        raise TranscriptionError("language must be 'auto' or a two-letter language code")
+    value = value.strip().lower()
+    if not re.fullmatch(r"auto|[a-z]{2}", value):
+        raise TranscriptionError("language must be 'auto' or a two-letter code such as pt, es, en, it")
+    return value
+
+
 def label(model: str, provider: str = "whisper_cpp") -> str:
     """The prefix stored in front of a transcript."""
-    source = f"whisper {Path(model).stem}" if provider == "whisper_cpp" else f"{provider} {model}"
+    source = display_model(model, provider)
     return f"{TRANSCRIPT_MARKER} ({source})] "
 
 
-def transcribe_http(source: Path, model: str) -> str:
+def display_model(model: str, provider: str) -> str:
+    """Human-readable model identity without exposing local filesystem paths."""
+    return f"whisper {Path(model).stem}" if provider == "whisper_cpp" else f"{provider} {model}"
+
+
+def transcribe_http(source: Path, model: str, lang: str | None = None) -> str:
     url = os.getenv("WHATSAPP_TRANSCRIPTION_URL", "").strip()
     try:
         parsed = urlsplit(url)
@@ -109,9 +158,9 @@ def transcribe_http(source: Path, model: str) -> str:
             "Set WHATSAPP_TRANSCRIPTION_URL to a full HTTP(S) transcription endpoint without credentials"
         )
     data = {"model": model, "response_format": "json"}
-    lang = os.getenv("WHATSAPP_TRANSCRIPTION_LANGUAGE", "auto").strip()
-    if lang and lang != "auto":
-        data["language"] = lang
+    selected_lang = select_language("openai_compatible", lang)
+    if selected_lang != "auto":
+        data["language"] = selected_lang
     key = os.getenv("WHATSAPP_TRANSCRIPTION_API_KEY", "").strip()
     headers = {"Authorization": f"Bearer {key}"} if key else {}
     try:
@@ -170,7 +219,11 @@ def normalise(text: str) -> str:
 
 
 def transcribe_file(
-    path: str | Path, work_dir: str | Path, model: str | None = None, provider: str = "whisper_cpp"
+    path: str | Path,
+    work_dir: str | Path,
+    model: str | None = None,
+    provider: str = "whisper_cpp",
+    language_override: str | None = None,
 ) -> str:
     """Transcribe one audio file and return its text.
 
@@ -182,7 +235,7 @@ def transcribe_file(
     if not source.is_file():
         raise TranscriptionError(f"Audio file not found: {source}")
     if provider == "openai_compatible":
-        return transcribe_http(source, model or configured_model(provider))
+        return transcribe_http(source, model or configured_model(provider), language_override)
     if not ffmpeg_available():
         raise TranscriptionError("FFmpeg is required to decode voice notes for transcription")
     if not whisper_available():
@@ -196,7 +249,10 @@ def transcribe_file(
         detail = decoded.stderr.decode(errors="replace").strip()[:200]
         raise TranscriptionError(f"Could not decode the audio: {detail}")
 
-    recognised = run_command(whisper_command(resolved_model, wav, language()), timeout=TRANSCRIPTION_TIMEOUT)
+    recognised = run_command(
+        whisper_command(resolved_model, wav, select_language("whisper_cpp", language_override)),
+        timeout=TRANSCRIPTION_TIMEOUT,
+    )
     if recognised.returncode != 0:
         detail = recognised.stderr.decode(errors="replace").strip()[:200]
         raise TranscriptionError(f"Transcription failed: {detail}")
