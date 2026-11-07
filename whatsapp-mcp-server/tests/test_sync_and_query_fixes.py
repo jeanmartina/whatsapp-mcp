@@ -1,11 +1,11 @@
 """Tests for sync status diagnostic tool, datetime query normalization, and database reconciliation."""
 
 import sqlite3
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+
 import pytest
 
 import whatsapp
-import main
 
 
 def _create_test_db(path):
@@ -55,7 +55,15 @@ def _create_test_db(path):
     cursor.execute(
         """INSERT INTO messages (id, chat_jid, sender, content, timestamp, is_from_me, media_type)
            VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        ("msg1", "test@s.whatsapp.net", "test@s.whatsapp.net", "plano de trabalho e VPN", "2026-10-08 14:46:32-03:00", 0, "text"),
+        (
+            "msg1",
+            "test@s.whatsapp.net",
+            "test@s.whatsapp.net",
+            "plano de trabalho e VPN",
+            "2026-10-08 14:46:32-03:00",
+            0,
+            "text",
+        ),
     )
     cursor.execute(
         """INSERT INTO messages (id, chat_jid, sender, content, timestamp, is_from_me, media_type)
@@ -119,6 +127,7 @@ def test_list_chats_message_available_and_media_type(sync_test_db):
 def test_get_sync_status(sync_test_db, monkeypatch):
     class DummyHealthResponse:
         status_code = 200
+
         def json(self):
             return {"status": "ok", "connected": True, "timestamp": 12345678}
 
@@ -142,12 +151,24 @@ def test_reconcile_database(sync_test_db):
         ("msg3", "test@s.whatsapp.net", "test@s.whatsapp.net", "newer msg", "2026-10-09 12:00:00-03:00", 0),
     )
     # Add an un-persisted sent message to audit
-    now = datetime.now(timezone.utc).isoformat(sep=" ")
+    now = datetime.now(UTC).isoformat(sep=" ")
     conn.execute(
         """INSERT INTO send_message_audit
            (send_id, chat_jid, recipient_name, text, text_sha256, authorization_code_hash, status, prepared_at, expires_at, sent_at, whatsapp_message_id)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        ("audit-1", "test@s.whatsapp.net", "Test User", "audit text", "sha", "code", "sent", now, now, now, "wa_audit_1"),
+        (
+            "audit-1",
+            "test@s.whatsapp.net",
+            "Test User",
+            "audit text",
+            "sha",
+            "code",
+            "sent",
+            now,
+            now,
+            now,
+            "wa_audit_1",
+        ),
     )
     conn.commit()
     conn.close()

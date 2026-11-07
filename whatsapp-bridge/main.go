@@ -2591,12 +2591,82 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 			"status":    "ok",
 			"connected": client.IsConnected(),
 			"timestamp": time.Now().Unix(),
+			"app_state": globalAppStateManager.GetDiagnostics(r.Context(), client),
 		}
 		if !client.IsConnected() {
 			status["status"] = "disconnected"
 			w.WriteHeader(http.StatusServiceUnavailable)
 		}
 		_ = json.NewEncoder(w).Encode(status)
+	}))
+
+	// App state diagnostics endpoint
+	mux.HandleFunc("/api/appstate/status", auth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		diag := globalAppStateManager.GetDiagnostics(r.Context(), client)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(diag)
+	}))
+
+	// App state on-demand recovery endpoint
+	mux.HandleFunc("/api/appstate/recover", auth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if client == nil || !client.IsConnected() {
+			http.Error(w, "Bridge client not connected", http.StatusServiceUnavailable)
+			return
+		}
+
+		collection := appstate.WAPatchRegularLow
+		var body struct {
+			Collection string `json:"collection"`
+		}
+		if r.Body != nil {
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body.Collection != "" {
+				collection = appstate.WAPatchName(body.Collection)
+			}
+		}
+
+		// Try FetchAppState fullSync first
+		syncErr := client.FetchAppState(r.Context(), collection, true, false)
+		if syncErr == nil {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success":    true,
+				"status":     "snapshot_resynced",
+				"collection": collection,
+			})
+			return
+		}
+
+		// If server snapshot fails with LTHash mismatch, dispatch peer recovery request
+		req := whatsmeow.BuildAppStateRecoveryRequest(collection)
+		resp, peerErr := client.SendPeerMessage(r.Context(), req)
+		if peerErr != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success":    false,
+				"error":      fmt.Sprintf("FetchAppState failed: %v; SendPeerMessage failed: %v", syncErr, peerErr),
+				"collection": collection,
+			})
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"success":    true,
+			"status":     "peer_recovery_requested",
+			"collection": collection,
+			"fetch_err":  syncErr.Error(),
+			"timestamp":  resp.Timestamp,
+		})
 	}))
 
 	// Handler for sending messages
@@ -2992,9 +3062,13 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int, token string, allowedMediaRoots []string) {
 	handler := newRESTMux(client, messageStore, port, token, allowedMediaRoots)
 
-	// Start the server with proper timeouts. Bind to loopback so the bridge is
-	// not reachable from the LAN; MCP clients talk to it over localhost.
-	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
+	// Start the server with proper timeouts. Defaults to loopback so the bridge is
+	// not reachable from the LAN; can be overridden via WHATSAPP_BRIDGE_HOST (e.g. 0.0.0.0 in Docker).
+	bindHost := "127.0.0.1"
+	if h := os.Getenv("WHATSAPP_BRIDGE_HOST"); h != "" {
+		bindHost = h
+	}
+	serverAddr := fmt.Sprintf("%s:%d", bindHost, port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
 	// Create server with timeouts for stability
@@ -3146,6 +3220,8 @@ func main() {
 		store.DeviceProps.Os = proto.String(name)
 		logger.Infof("Linked-device name set to %q (WHATSAPP_DEVICE_NAME)", name)
 	}
+	// Identify as Chrome Web to prevent companion-phone 14-day inactivity re-auth warnings
+	store.DeviceProps.PlatformType = waCompanionReg.DeviceProps_CHROME.Enum()
 
 	// Create client instance
 	client := whatsmeow.NewClient(deviceStore, logger)
@@ -3363,6 +3439,9 @@ func main() {
 
 		case *events.Connected:
 			logger.Infof("✓ Successfully connected to WhatsApp servers")
+			if err := client.SendPresence(context.Background(), types.PresenceAvailable); err != nil {
+				logger.Warnf("Failed to send presence: %v", err)
+			}
 			go func() {
 				// Resync AppState patches (such as labels/chat filters) in background
 				ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -3465,6 +3544,8 @@ func main() {
 
 			// Print QR codes for pairing with the phone.
 			switch renderPairingQRCodes(qrChan, os.Stdout, func(code string, w io.Writer) {
+				_ = os.WriteFile("store/last_qr.txt", []byte(code), 0600)
+				fmt.Printf("\nRAW_PAIRING_CODE: %s\n", code)
 				qrterminal.GenerateHalfBlock(code, qrterminal.L, w)
 			}) {
 			case pairingQRSucceeded:

@@ -13,6 +13,7 @@ import (
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/appstate"
 	"go.mau.fi/whatsmeow/proto/waCommon"
+	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
 	"google.golang.org/protobuf/proto"
 )
@@ -56,6 +57,8 @@ type whatsAppReadClient interface {
 	IsConnected() bool
 	MarkRead(ctx context.Context, ids []types.MessageID, timestamp time.Time, chat, sender types.JID, receiptTypeExtra ...types.ReceiptType) error
 	SendAppState(ctx context.Context, patch appstate.PatchInfo) error
+	FetchAppState(ctx context.Context, name appstate.WAPatchName, fullSync, onlyIfNotSynced bool) error
+	SendPeerMessage(ctx context.Context, message *waE2E.Message) (whatsmeow.SendResponse, error)
 }
 
 // isMarkReadAllowed checks if marking chats as read is permitted.
@@ -265,6 +268,7 @@ func handleMarkChatRead(
 			Success: false,
 			Status:  "forbidden",
 			Error:   "WHATSAPP_MARK_READ_ENABLED=false",
+			Unread:  true,
 		})
 		return
 	}
@@ -488,14 +492,17 @@ func handleMarkChatRead(
 	}
 
 	patch := appstate.BuildMarkChatAsRead(resolvedChatJID, true, readThroughTimestamp, lastMessageKey)
-	if sendErr := cli.SendAppState(context.Background(), patch); sendErr != nil {
+	if sendErr := globalAppStateManager.SendAppStateWithRecovery(r.Context(), cli, patch); sendErr != nil {
 		fmt.Printf("Warning: failed to send app state mark-read patch for %s: %v\n", req.ChatJID, sendErr)
+		isUnread, _ := messageStore.IsChatUnread(req.ChatJID)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		_ = json.NewEncoder(w).Encode(MarkChatReadResponse{
 			Success: false,
+			ChatJID: req.ChatJID,
 			Status:  "internal_error",
 			Error:   fmt.Sprintf("Failed to sync app state with WhatsApp: %v", sendErr),
+			Unread:  isUnread,
 		})
 		return
 	}

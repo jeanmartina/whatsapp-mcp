@@ -83,7 +83,6 @@ def _normalize_query_datetime(val: str | datetime | None) -> str | None:
         return s
 
 
-
 def _ensure_chat_list_schema(conn: sqlite3.Connection) -> None:
     """Ensure chat_lists, chat_list_items, and send_message_audit tables exist."""
     cursor = conn.cursor()
@@ -140,6 +139,16 @@ def _ensure_chat_list_schema(conn: sqlite3.Connection) -> None:
     cursor.execute("""
         CREATE INDEX IF NOT EXISTS idx_send_audit_chat_jid ON send_message_audit(chat_jid);
     """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_send_audit_code_hash ON send_message_audit(authorization_code_hash);
+    """)
+    cursor.execute("PRAGMA table_info(send_message_audit);")
+    audit_cols = {col_info[1] for col_info in cursor.fetchall()}
+    if "authorization_code" not in audit_cols:
+        try:
+            cursor.execute("ALTER TABLE send_message_audit ADD COLUMN authorization_code TEXT;")
+        except sqlite3.OperationalError:
+            pass
     conn.commit()
 
 
@@ -199,7 +208,13 @@ class Chat:
             return False
         if self.last_read_time is None:
             return True
-        return self.last_message_time > self.last_read_time
+        t_msg = self.last_message_time
+        t_read = self.last_read_time
+        if t_msg.tzinfo is None and t_read.tzinfo is not None:
+            t_msg = t_msg.replace(tzinfo=t_read.tzinfo)
+        elif t_msg.tzinfo is not None and t_read.tzinfo is None:
+            t_read = t_read.replace(tzinfo=t_msg.tzinfo)
+        return t_msg > t_read
 
 
 @dataclass
@@ -316,7 +331,6 @@ def _last_message_join(chat_alias: str, msg_alias: str) -> str:
                     LIMIT 1
                 )
     """
-
 
 
 def _sender_aliases(value: str) -> list[str]:
@@ -1478,24 +1492,35 @@ def mark_chat_read(
         if response.status_code == 200:
             return response.json()
 
+        chat = get_chat(chat_jid_clean, include_last_message=True)
+        current_unread = chat.get("unread", True) if isinstance(chat, dict) else True
+
         try:
             err_data = response.json()
             if isinstance(err_data, dict) and "error" in err_data:
+                if not err_data.get("success", False):
+                    err_data["unread"] = current_unread
                 return err_data
         except Exception:
             pass
 
-        status_label = "forbidden" if response.status_code == 403 else "unavailable" if response.status_code == 503 else "failed"
+        status_label = (
+            "forbidden" if response.status_code == 403 else "unavailable" if response.status_code == 503 else "failed"
+        )
         return {
             "success": False,
             "status": status_label,
             "error": f"Bridge error HTTP {response.status_code}: {response.text}",
+            "unread": current_unread,
         }
     except requests.RequestException as e:
+        chat = get_chat(chat_jid_clean, include_last_message=True)
+        current_unread = chat.get("unread", True) if isinstance(chat, dict) else True
         return {
             "success": False,
             "status": "unavailable",
             "error": f"WhatsApp bridge unreachable: {e}",
+            "unread": current_unread,
         }
 
 
@@ -1538,6 +1563,224 @@ def mark_chats_read(
         "total": len(chat_jids),
         "results": results,
     }
+
+
+def _ensure_pending_read_marks_schema(conn: sqlite3.Connection) -> None:
+    """Ensure table and indexes for pending read mark retry queue exist."""
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS pending_read_marks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_jid TEXT NOT NULL,
+            message_id TEXT,
+            created_at TEXT NOT NULL,
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            max_retries INTEGER NOT NULL DEFAULT 5,
+            last_error TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            next_retry_at TEXT,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_pending_read_marks_status
+        ON pending_read_marks(status, next_retry_at)
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_pending_read_marks_chat
+        ON pending_read_marks(chat_jid)
+    """)
+    conn.commit()
+
+
+def enqueue_pending_read_mark(
+    chat_jid: str,
+    message_id: str | None = None,
+    last_error: str | None = None,
+    max_retries: int = 5,
+    db_path: str | None = None,
+) -> int:
+    """Enqueue or update a pending read mark operation in the persistent queue."""
+    target_db = db_path if db_path is not None else MESSAGES_DB_PATH
+    conn = sqlite3.connect(target_db)
+    try:
+        _ensure_pending_read_marks_schema(conn)
+        cursor = conn.cursor()
+        now_str = datetime.now(UTC).isoformat()
+
+        cursor.execute(
+            """
+            SELECT id, message_id, retry_count
+            FROM pending_read_marks
+            WHERE chat_jid = ? AND status = 'pending'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (chat_jid,),
+        )
+        row = cursor.fetchone()
+        if row:
+            item_id = row[0]
+            chosen_msg_id = message_id or row[1]
+            cursor.execute(
+                """
+                UPDATE pending_read_marks
+                SET message_id = ?, last_error = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (chosen_msg_id, last_error, now_str, item_id),
+            )
+            conn.commit()
+            return item_id
+        else:
+            cursor.execute(
+                """
+                INSERT INTO pending_read_marks
+                (chat_jid, message_id, created_at, retry_count, max_retries, last_error, status, next_retry_at, updated_at)
+                VALUES (?, ?, ?, 0, ?, ?, 'pending', ?, ?)
+                """,
+                (chat_jid, message_id, now_str, max_retries, last_error, now_str, now_str),
+            )
+            conn.commit()
+            return cursor.lastrowid
+    finally:
+        conn.close()
+
+
+def process_pending_read_marks(
+    max_items: int = 10,
+    db_path: str | None = None,
+) -> dict[str, Any]:
+    """Process pending read marks from the recoverable queue with backoff and retry limits."""
+    target_db = db_path if db_path is not None else MESSAGES_DB_PATH
+    conn = sqlite3.connect(target_db)
+    try:
+        _ensure_pending_read_marks_schema(conn)
+        cursor = conn.cursor()
+        now = datetime.now(UTC)
+        now_str = now.isoformat()
+
+        cursor.execute(
+            """
+            SELECT id, chat_jid, message_id, retry_count, max_retries
+            FROM pending_read_marks
+            WHERE status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= ?)
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            (now_str, max_items),
+        )
+        items = cursor.fetchall()
+        processed = 0
+        succeeded = 0
+        failed = 0
+
+        for item_id, chat_jid, message_id, retry_count, max_retries in items:
+            processed += 1
+            read_res = mark_chat_read(chat_jid, message_id=message_id)
+            if read_res.get("success"):
+                succeeded += 1
+                cursor.execute(
+                    """
+                    UPDATE pending_read_marks
+                    SET status = 'completed', completed_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now_str, now_str, item_id),
+                )
+            else:
+                new_retry = retry_count + 1
+                err_msg = read_res.get("error", "Unknown error")
+                if new_retry >= max_retries:
+                    failed += 1
+                    cursor.execute(
+                        """
+                        UPDATE pending_read_marks
+                        SET status = 'failed', retry_count = ?, last_error = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (new_retry, err_msg, now_str, item_id),
+                    )
+                else:
+                    backoff_sec = min(300, 2 ** new_retry * 5)
+                    next_retry = (now + timedelta(seconds=backoff_sec)).isoformat()
+                    cursor.execute(
+                        """
+                        UPDATE pending_read_marks
+                        SET retry_count = ?, next_retry_at = ?, last_error = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (new_retry, next_retry, err_msg, now_str, item_id),
+                    )
+        conn.commit()
+
+        cursor.execute("SELECT COUNT(*) FROM pending_read_marks WHERE status = 'pending'")
+        remaining_row = cursor.fetchone()
+        remaining = remaining_row[0] if remaining_row else 0
+
+        return {
+            "processed": processed,
+            "succeeded": succeeded,
+            "failed": failed,
+            "remaining_pending": remaining,
+        }
+    finally:
+        conn.close()
+
+
+def get_read_queue_status(
+    limit: int = 20,
+    db_path: str | None = None,
+) -> dict[str, Any]:
+    """Retrieve observable status and diagnostic summary of the pending read queue."""
+    target_db = db_path if db_path is not None else MESSAGES_DB_PATH
+    conn = sqlite3.connect(target_db)
+    try:
+        _ensure_pending_read_marks_schema(conn)
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT status, COUNT(*) FROM pending_read_marks GROUP BY status")
+        counts = dict(cursor.fetchall())
+        pending_count = counts.get("pending", 0)
+        completed_count = counts.get("completed", 0)
+        failed_count = counts.get("failed", 0)
+        total_count = sum(counts.values())
+
+        cursor.execute(
+            """
+            SELECT id, chat_jid, message_id, retry_count, max_retries, status, last_error, created_at, updated_at, next_retry_at, completed_at
+            FROM pending_read_marks
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        rows = cursor.fetchall()
+        items = []
+        for r in rows:
+            items.append({
+                "id": r[0],
+                "chat_jid": r[1],
+                "message_id": r[2],
+                "retry_count": r[3],
+                "max_retries": r[4],
+                "status": r[5],
+                "last_error": r[6],
+                "created_at": r[7],
+                "updated_at": r[8],
+                "next_retry_at": r[9],
+                "completed_at": r[10],
+            })
+
+        return {
+            "pending_count": pending_count,
+            "completed_count": completed_count,
+            "failed_count": failed_count,
+            "total_count": total_count,
+            "items": items,
+        }
+    finally:
+        conn.close()
 
 
 def download_media(message_id: str, chat_jid: str) -> str | None:
@@ -2149,8 +2392,8 @@ def list_chats_by_list(
         if not target_list_id and list_name:
             cursor.execute(
                 """
-                SELECT id FROM chat_lists 
-                WHERE LOWER(name) = LOWER(?) AND deleted = 0 
+                SELECT id FROM chat_lists
+                WHERE LOWER(name) = LOWER(?) AND deleted = 0
                 ORDER BY CASE WHEN source = 'whatsapp' THEN 0 ELSE 1 END
                 LIMIT 1
                 """,
@@ -2161,8 +2404,8 @@ def list_chats_by_list(
                 # Try partial match if exact match fails
                 cursor.execute(
                     """
-                    SELECT id FROM chat_lists 
-                    WHERE instr(LOWER(name), LOWER(?)) > 0 AND deleted = 0 
+                    SELECT id FROM chat_lists
+                    WHERE instr(LOWER(name), LOWER(?)) > 0 AND deleted = 0
                     ORDER BY CASE WHEN source = 'whatsapp' THEN 0 ELSE 1 END
                     LIMIT 1
                     """,
@@ -2456,6 +2699,86 @@ def remove_chat_from_list(list_name: str, chat_jid: str) -> dict[str, Any]:
             conn.close()
 
 
+def _normalize_commit_args(
+    authorization_code: str | None = None,
+    send_id: str | None = None,
+) -> tuple[str, str | None]:
+    """Normalize authorization_code and send_id, gracefully handling:
+    - (authorization_code, send_id=None) [New standard]
+    - (send_id, authorization_code)      [Legacy positional]
+    - (authorization_code=..., send_id=...) [Keyword]
+    - (send_id=..., authorization_code=...) [Legacy keyword]
+    """
+    code_cand = authorization_code.strip() if authorization_code else None
+    id_cand = send_id.strip() if send_id else None
+
+    if code_cand and id_cand:
+        is_code_1 = code_cand.upper().startswith("ENVIAR") or (len(code_cand) == 4 and code_cand.isalnum())
+        is_code_2 = id_cand.upper().startswith("ENVIAR") or (len(id_cand) == 4 and id_cand.isalnum())
+        if not is_code_1 and is_code_2:
+            return id_cand, code_cand
+        return code_cand, id_cand
+
+    if code_cand and not id_cand:
+        if not (code_cand.upper().startswith("ENVIAR") or (len(code_cand) == 4 and code_cand.isalnum())):
+            raise ValueError("authorization_code is required")
+        return code_cand, None
+
+    if id_cand and not code_cand:
+        if id_cand.upper().startswith("ENVIAR") or (len(id_cand) == 4 and id_cand.isalnum()):
+            return id_cand, None
+        raise ValueError("authorization_code is required")
+
+    raise ValueError("authorization_code is required")
+
+
+def _reconcile_sent_message(
+    conn: sqlite3.Connection,
+    chat_jid: str,
+    text: str,
+    prepared_at: str | datetime | None = None,
+) -> tuple[str, str] | None:
+    """Check if an outgoing message matching chat_jid and text exists in messages table,
+    confirming delivery after a timeout or uncertainty.
+
+    Returns (message_id, timestamp) or None.
+    """
+    try:
+        cursor = conn.cursor()
+        if prepared_at:
+            prep_str = prepared_at.isoformat() if isinstance(prepared_at, datetime) else str(prepared_at)
+            cursor.execute(
+                """
+                SELECT id, timestamp
+                FROM messages
+                WHERE chat_jid = ? AND content = ? AND is_from_me = 1 AND timestamp >= ?
+                ORDER BY timestamp DESC
+                LIMIT 1
+                """,
+                (chat_jid, text, prep_str),
+            )
+            row = cursor.fetchone()
+            if row:
+                return row[0], row[1]
+
+        cursor.execute(
+            """
+            SELECT id, timestamp
+            FROM messages
+            WHERE chat_jid = ? AND content = ? AND is_from_me = 1
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            (chat_jid, text),
+        )
+        row = cursor.fetchone()
+        if row:
+            return row[0], row[1]
+    except Exception:
+        pass
+    return None
+
+
 def prepare_send_message(
     chat_jid: str,
     text: str,
@@ -2488,12 +2811,6 @@ def prepare_send_message(
     text_clean = text
     text_hash = hashlib.sha256(text_clean.encode("utf-8")).hexdigest()
 
-    # Generate 4-character random code suffix (excluding ambiguous chars 0, O, 1, I)
-    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-    code_suffix = "".join(random.choices(alphabet, k=4))
-    authorization_code = f"ENVIAR {code_suffix}"
-    code_hash = hashlib.sha256(authorization_code.encode("utf-8")).hexdigest()
-
     send_id = str(uuid.uuid4())
     now = datetime.now(UTC)
     expires_at = now + timedelta(minutes=10)
@@ -2506,13 +2823,28 @@ def prepare_send_message(
         _ensure_chat_list_schema(conn)
         cursor = conn.cursor()
 
+        # Generate 4-character random code suffix unique among active pending drafts
+        alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+        authorization_code = ""
+        code_hash = ""
+        for _ in range(30):
+            code_suffix = "".join(random.choices(alphabet, k=4))
+            authorization_code = f"ENVIAR {code_suffix}"
+            code_hash = hashlib.sha256(authorization_code.encode("utf-8")).hexdigest()
+            cursor.execute(
+                "SELECT 1 FROM send_message_audit WHERE authorization_code_hash = ? AND status = 'pending' AND expires_at > ?",
+                (code_hash, now.isoformat()),
+            )
+            if not cursor.fetchone():
+                break
+
         cursor.execute(
             """
             INSERT INTO send_message_audit (
                 send_id, chat_jid, recipient_name, text, text_sha256,
-                reply_to_message_id, authorization_code_hash, status,
+                reply_to_message_id, authorization_code, authorization_code_hash, status,
                 prepared_at, expires_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
             """,
             (
                 send_id,
@@ -2521,6 +2853,7 @@ def prepare_send_message(
                 text_clean,
                 text_hash,
                 reply_to_message_id,
+                authorization_code,
                 code_hash,
                 now.isoformat(),
                 expires_at.isoformat(),
@@ -2536,6 +2869,11 @@ def prepare_send_message(
             "text_sha256": text_hash,
             "expires_at": expires_at.isoformat(),
             "authorization_code": authorization_code,
+            "instructions": (
+                f"Ask the user to confirm by sending exactly: {authorization_code}. "
+                f"When the user confirms with {authorization_code}, call commit_send_message(authorization_code='{authorization_code}'). "
+                f"NEVER call prepare_send_message again when receiving this code."
+            ),
         }
         if not is_write_enabled():
             result["warning"] = (
@@ -2549,22 +2887,24 @@ def prepare_send_message(
 
 
 def commit_send_message(
-    send_id: str,
-    authorization_code: str,
+    authorization_code: str | None = None,
+    send_id: str | None = None,
 ) -> dict[str, Any]:
     """Execute message delivery after explicit human authorization code verification.
 
     This is the ONLY function authorized to send messages to WhatsApp.
     Validates that:
     1. Server write operations are enabled (WHATSAPP_WRITE_ENABLED=true).
-    2. The draft send_id exists and is in 'pending' status.
+    2. The draft exists and is resolved by authorization_code (and optional send_id).
     3. The draft has not expired (10-minute window).
     4. The authorization code matches exactly.
     5. The draft text content and SHA-256 hash are intact.
+    6. Repeated commits return existing sent result without duplicating.
+    7. Timeout with uncertain result reconciles with database before failing.
 
     Args:
-        send_id: Identifier generated by prepare_send_message
         authorization_code: Confirmation code (e.g. "ENVIAR K7M4")
+        send_id: Optional identifier generated by prepare_send_message
 
     Returns:
         Delivery result dictionary with status and details.
@@ -2579,13 +2919,11 @@ def commit_send_message(
             ),
         }
 
-    if not send_id or not send_id.strip():
-        raise ValueError("send_id is required")
-    if not authorization_code or not authorization_code.strip():
-        raise ValueError("authorization_code is required")
+    actual_code, actual_send_id = _normalize_commit_args(authorization_code, send_id)
 
-    send_id_clean = send_id.strip()
-    code_input = authorization_code.strip().upper()
+    code_input = actual_code.strip().upper()
+    if not code_input.startswith("ENVIAR ") and len(code_input) == 4 and code_input.isalnum():
+        code_input = f"ENVIAR {code_input}"
     code_hash = hashlib.sha256(code_input.encode("utf-8")).hexdigest()
     now = datetime.now(UTC)
 
@@ -2594,26 +2932,62 @@ def commit_send_message(
         _ensure_chat_list_schema(conn)
         cursor = conn.cursor()
 
-        cursor.execute(
-            """
-            SELECT
-                chat_jid, recipient_name, text, text_sha256,
-                reply_to_message_id, authorization_code_hash,
-                status, expires_at
-            FROM send_message_audit
-            WHERE send_id = ?
-            """,
-            (send_id_clean,),
-        )
-        row = cursor.fetchone()
-        if not row:
-            return {
-                "success": False,
-                "status": "failed",
-                "error": f"Draft send_id '{send_id_clean}' not found.",
-            }
+        if actual_send_id:
+            cursor.execute(
+                """
+                SELECT
+                    send_id, chat_jid, recipient_name, text, text_sha256,
+                    reply_to_message_id, authorization_code_hash,
+                    status, expires_at, sent_at, whatsapp_message_id, error_message, prepared_at
+                FROM send_message_audit
+                WHERE send_id = ?
+                """,
+                (actual_send_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return {
+                    "success": False,
+                    "status": "failed",
+                    "error": f"Draft send_id '{actual_send_id}' not found.",
+                }
+            if row[6] != code_hash:
+                return {
+                    "success": False,
+                    "status": "unauthorized",
+                    "error": "Invalid authorization code for the specified send_id. Authorization codes are case-insensitive and formatted as 'ENVIAR XXXX'.",
+                }
+        else:
+            cursor.execute(
+                """
+                SELECT
+                    send_id, chat_jid, recipient_name, text, text_sha256,
+                    reply_to_message_id, authorization_code_hash,
+                    status, expires_at, sent_at, whatsapp_message_id, error_message, prepared_at
+                FROM send_message_audit
+                WHERE authorization_code_hash = ?
+                ORDER BY
+                    CASE
+                        WHEN status = 'pending' THEN 0
+                        WHEN status = 'sending' THEN 1
+                        WHEN status = 'sent' THEN 2
+                        ELSE 3
+                    END,
+                    prepared_at DESC
+                LIMIT 1
+                """,
+                (code_hash,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return {
+                    "success": False,
+                    "status": "unauthorized",
+                    "error": f"No message draft found for authorization code '{code_input}'. Please verify the code or prepare a new message.",
+                }
 
         (
+            row_send_id,
             chat_jid,
             recipient_name,
             text,
@@ -2622,15 +2996,68 @@ def commit_send_message(
             stored_code_hash,
             status,
             expires_at_str,
+            sent_at_str,
+            wa_msg_id,
+            error_message,
+            prepared_at_str,
         ) = row
 
-        if status != "pending":
+        # 1. Protection against repeated commits: return existing sent result without resending
+        if status == "sent":
+            return {
+                "success": True,
+                "status": "sent",
+                "message_sent": True,
+                "send_id": row_send_id,
+                "chat_jid": chat_jid,
+                "recipient_name": recipient_name,
+                "whatsapp_message_id": wa_msg_id,
+                "sent_at": sent_at_str or now.isoformat(),
+                "already_sent": True,
+            }
+
+        # 2. Reconcile if status is sending or failed: check if already in messages table
+        reconciled = _reconcile_sent_message(conn, chat_jid, text, prepared_at_str)
+        if reconciled:
+            rec_msg_id, rec_ts = reconciled
+            now_str = now.astimezone().isoformat(sep=" ")
+            cursor.execute(
+                """
+                UPDATE send_message_audit
+                SET status = 'sent', authorized_at = COALESCE(authorized_at, ?), sent_at = ?, whatsapp_message_id = ?, error_message = NULL
+                WHERE send_id = ?
+                """,
+                (now_str, str(rec_ts), rec_msg_id, row_send_id),
+            )
+            conn.commit()
+            return {
+                "success": True,
+                "status": "sent",
+                "send_id": row_send_id,
+                "chat_jid": chat_jid,
+                "recipient_name": recipient_name,
+                "whatsapp_message_id": rec_msg_id,
+                "sent_at": str(rec_ts),
+                "reconciled": True,
+            }
+
+        if status == "sending":
+            return {
+                "success": False,
+                "status": "sending",
+                "send_id": row_send_id,
+                "error": "A send operation for this draft is currently in progress.",
+            }
+
+        if status == "tampered":
             return {
                 "success": False,
                 "status": "failed",
-                "error": f"Draft '{send_id_clean}' cannot be used because it is already '{status}'.",
+                "send_id": row_send_id,
+                "error": "Message integrity check failed (SHA-256 mismatch). Send cancelled.",
             }
 
+        # 3. Check expiration
         expires_at = datetime.fromisoformat(expires_at_str)
         if expires_at.tzinfo is None:
             expires_at = expires_at.replace(tzinfo=UTC)
@@ -2638,37 +3065,98 @@ def commit_send_message(
         if now > expires_at:
             cursor.execute(
                 "UPDATE send_message_audit SET status = 'expired' WHERE send_id = ?",
-                (send_id_clean,),
+                (row_send_id,),
             )
             conn.commit()
             return {
                 "success": False,
                 "status": "expired",
-                "error": f"Authorization code for send_id '{send_id_clean}' expired at {expires_at_str}.",
+                "send_id": row_send_id,
+                "error": f"Authorization code for draft '{row_send_id}' expired at {expires_at_str}.",
             }
 
-        if code_hash != stored_code_hash:
-            return {
-                "success": False,
-                "status": "unauthorized",
-                "error": "Invalid authorization code. Authorization codes are case-insensitive and formatted as 'ENVIAR XXXX'.",
-            }
-
-        # Check content integrity
+        # 4. Check content integrity (immutable link between code, recipient, and text)
         current_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
         if current_hash != stored_text_hash:
             cursor.execute(
                 "UPDATE send_message_audit SET status = 'tampered' WHERE send_id = ?",
-                (send_id_clean,),
+                (row_send_id,),
             )
             conn.commit()
             return {
                 "success": False,
                 "status": "failed",
+                "send_id": row_send_id,
                 "error": "Message integrity check failed (SHA-256 mismatch). Send cancelled.",
             }
 
-        # Dispatch through WhatsApp bridge REST API
+        # 5. Atomic state transition to 'sending' to protect against simultaneous commits
+        cursor.execute(
+            "UPDATE send_message_audit SET status = 'sending' WHERE send_id = ? AND status IN ('pending', 'failed')",
+            (row_send_id,),
+        )
+        conn.commit()
+        if cursor.rowcount == 0:
+            # Another concurrent execution updated this record
+            cursor.execute(
+                "SELECT status, whatsapp_message_id, sent_at FROM send_message_audit WHERE send_id = ?",
+                (row_send_id,),
+            )
+            latest = cursor.fetchone()
+            if latest and latest[0] == "sent":
+                return {
+                    "success": True,
+                    "status": "sent",
+                    "message_sent": True,
+                    "send_id": row_send_id,
+                    "chat_jid": chat_jid,
+                    "recipient_name": recipient_name,
+                    "whatsapp_message_id": latest[1],
+                    "sent_at": latest[2] or now.isoformat(),
+                    "already_sent": True,
+                }
+            return {
+                "success": False,
+                "status": latest[0] if latest else "unknown",
+                "message_sent": False,
+                "send_id": row_send_id,
+                "error": "Concurrent send request in progress for this draft.",
+            }
+
+        # Capture the latest inbound message ID prior to dispatching send
+        pre_send_inbound_id = None
+        try:
+            cursor.execute(
+                """
+                SELECT id
+                FROM messages
+                WHERE chat_jid = ? AND is_from_me = 0
+                ORDER BY timestamp DESC, id DESC
+                LIMIT 1
+                """,
+                (chat_jid,),
+            )
+            pre_send_row = cursor.fetchone()
+            pre_send_inbound_id = pre_send_row[0] if pre_send_row else None
+        except sqlite3.OperationalError:
+            pass
+
+        def _apply_auto_mark_read() -> tuple[bool, str, str | None]:
+            if not pre_send_inbound_id:
+                return True, "no_inbound_messages", None
+            if not is_mark_read_enabled():
+                return False, "disabled", "WHATSAPP_MARK_READ_ENABLED=false"
+            read_res = mark_chat_read(chat_jid, message_id=pre_send_inbound_id)
+            if read_res.get("success"):
+                return True, "marked", None
+            err_msg = read_res.get("error", "Failed to mark chat read")
+            try:
+                enqueue_pending_read_mark(chat_jid, message_id=pre_send_inbound_id, last_error=err_msg)
+            except Exception as q_err:
+                print(f"Warning: failed to enqueue pending read mark: {q_err}")
+            return False, read_res.get("status", "failed"), err_msg
+
+        # 6. Dispatch through WhatsApp bridge REST API
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {
             "recipient": chat_jid,
@@ -2691,10 +3179,10 @@ def commit_send_message(
                 cursor.execute(
                     """
                     UPDATE send_message_audit
-                    SET status = 'sent', authorized_at = ?, sent_at = ?, whatsapp_message_id = ?
+                    SET status = 'sent', authorized_at = ?, sent_at = ?, whatsapp_message_id = ?, error_message = NULL
                     WHERE send_id = ?
                     """,
-                    (now_str, now_str, wa_msg_id, send_id_clean),
+                    (now_str, now_str, wa_msg_id, row_send_id),
                 )
                 if wa_msg_id and not wa_msg_id.startswith("Message sent"):
                     try:
@@ -2717,15 +3205,23 @@ def commit_send_message(
                     except sqlite3.OperationalError:
                         pass
                 conn.commit()
-                return {
+
+                read_ok, read_status, read_err = _apply_auto_mark_read()
+                ret = {
                     "success": True,
                     "status": "sent",
-                    "send_id": send_id_clean,
+                    "message_sent": True,
+                    "send_id": row_send_id,
                     "chat_jid": chat_jid,
                     "recipient_name": recipient_name,
                     "whatsapp_message_id": wa_msg_id,
                     "sent_at": now.isoformat(),
+                    "read_marked": read_ok,
+                    "read_status": read_status,
                 }
+                if not read_ok and read_err:
+                    ret["read_error"] = read_err
+                return ret
             else:
                 err_text = resp.text
                 cursor.execute(
@@ -2734,31 +3230,203 @@ def commit_send_message(
                     SET status = 'failed', authorized_at = ?, error_message = ?
                     WHERE send_id = ?
                     """,
-                    (now.isoformat(), f"HTTP {resp.status_code}: {err_text}", send_id_clean),
+                    (now.isoformat(), f"HTTP {resp.status_code}: {err_text}", row_send_id),
                 )
                 conn.commit()
                 return {
                     "success": False,
                     "status": "failed",
-                    "send_id": send_id_clean,
+                    "message_sent": False,
+                    "send_id": row_send_id,
                     "error": f"Bridge error HTTP {resp.status_code}: {err_text}",
                 }
         except Exception as exc:
+            # Reconcile on timeout or network error before concluding failure
+            reconciled = _reconcile_sent_message(conn, chat_jid, text, prepared_at_str)
+            if reconciled:
+                rec_msg_id, rec_ts = reconciled
+                now_str = now.astimezone().isoformat(sep=" ")
+                cursor.execute(
+                    """
+                    UPDATE send_message_audit
+                    SET status = 'sent', authorized_at = ?, sent_at = ?, whatsapp_message_id = ?, error_message = NULL
+                    WHERE send_id = ?
+                    """,
+                    (now_str, str(rec_ts), rec_msg_id, row_send_id),
+                )
+                conn.commit()
+
+                read_ok, read_status, read_err = _apply_auto_mark_read()
+                ret = {
+                    "success": True,
+                    "status": "sent",
+                    "message_sent": True,
+                    "send_id": row_send_id,
+                    "chat_jid": chat_jid,
+                    "recipient_name": recipient_name,
+                    "whatsapp_message_id": rec_msg_id,
+                    "sent_at": str(rec_ts),
+                    "reconciled": True,
+                    "read_marked": read_ok,
+                    "read_status": read_status,
+                }
+                if not read_ok and read_err:
+                    ret["read_error"] = read_err
+                return ret
+            else:
+                cursor.execute(
+                    """
+                    UPDATE send_message_audit
+                    SET status = 'failed', authorized_at = ?, error_message = ?
+                    WHERE send_id = ?
+                    """,
+                    (now.isoformat(), f"Bridge communication error: {exc}", row_send_id),
+                )
+                conn.commit()
+                return {
+                    "success": False,
+                    "status": "failed",
+                    "message_sent": False,
+                    "send_id": row_send_id,
+                    "error": f"Bridge communication error: {exc}",
+                }
+    finally:
+        if "conn" in locals():
+            conn.close()
+
+
+def get_send_status(
+    authorization_code: str | None = None,
+    send_id: str | None = None,
+) -> dict[str, Any]:
+    """Check the status of a message send draft (read-only).
+
+    Allows inspecting draft details, confirmation status, and delivery result
+    by authorization code or send_id.
+
+    Args:
+        authorization_code: Confirmation code (e.g. 'ENVIAR K7M4')
+        send_id: Draft UUID from prepare_send_message
+
+    Returns:
+        Dictionary containing draft status, delivery details, and timestamps.
+    """
+    code_cand = authorization_code.strip() if authorization_code else None
+    id_cand = send_id.strip() if send_id else None
+
+    # Handle argument swapping if needed
+    if code_cand and id_cand:
+        is_code_1 = code_cand.upper().startswith("ENVIAR") or (len(code_cand) == 4 and code_cand.isalnum())
+        is_code_2 = id_cand.upper().startswith("ENVIAR") or (len(id_cand) == 4 and id_cand.isalnum())
+        if not is_code_1 and is_code_2:
+            id_cand, code_cand = code_cand, id_cand
+
+    if not code_cand and not id_cand:
+        raise ValueError("Either authorization_code or send_id is required")
+
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        _ensure_chat_list_schema(conn)
+        cursor = conn.cursor()
+
+        if id_cand:
             cursor.execute(
                 """
-                UPDATE send_message_audit
-                SET status = 'failed', authorized_at = ?, error_message = ?
+                SELECT
+                    send_id, chat_jid, recipient_name, text, text_sha256,
+                    reply_to_message_id, authorization_code, status,
+                    prepared_at, expires_at, authorized_at, sent_at,
+                    whatsapp_message_id, error_message
+                FROM send_message_audit
                 WHERE send_id = ?
                 """,
-                (now.isoformat(), str(exc), send_id_clean),
+                (id_cand,),
             )
-            conn.commit()
+        else:
+            code_input = code_cand.upper()
+            if not code_input.startswith("ENVIAR ") and len(code_input) == 4 and code_input.isalnum():
+                code_input = f"ENVIAR {code_input}"
+            code_hash = hashlib.sha256(code_input.encode("utf-8")).hexdigest()
+            cursor.execute(
+                """
+                SELECT
+                    send_id, chat_jid, recipient_name, text, text_sha256,
+                    reply_to_message_id, authorization_code, status,
+                    prepared_at, expires_at, authorized_at, sent_at,
+                    whatsapp_message_id, error_message
+                FROM send_message_audit
+                WHERE authorization_code_hash = ?
+                ORDER BY
+                    CASE
+                        WHEN status = 'pending' THEN 0
+                        WHEN status = 'sending' THEN 1
+                        WHEN status = 'sent' THEN 2
+                        ELSE 3
+                    END,
+                    prepared_at DESC
+                LIMIT 1
+                """,
+                (code_hash,),
+            )
+
+        row = cursor.fetchone()
+        if not row:
             return {
                 "success": False,
-                "status": "failed",
-                "send_id": send_id_clean,
-                "error": f"Bridge communication error: {exc}",
+                "status": "not_found",
+                "error": "Message draft not found.",
             }
+
+        (
+            row_send_id,
+            chat_jid,
+            recipient_name,
+            text,
+            text_sha256,
+            reply_to_id,
+            stored_code,
+            status,
+            prepared_at,
+            expires_at_str,
+            authorized_at,
+            sent_at,
+            wa_msg_id,
+            error_message,
+        ) = row
+
+        now = datetime.now(UTC)
+        expires_at = datetime.fromisoformat(expires_at_str)
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=UTC)
+
+        # Check if reconciled in messages table if in sending/failed
+        if status in ("sending", "failed"):
+            reconciled = _reconcile_sent_message(conn, chat_jid, text, prepared_at)
+            if reconciled:
+                status = "sent"
+                wa_msg_id, sent_at = reconciled
+                error_message = None
+
+        if status == "pending" and now > expires_at:
+            status = "expired"
+
+        return {
+            "success": True,
+            "send_id": row_send_id,
+            "chat_jid": chat_jid,
+            "recipient_name": recipient_name,
+            "text": text,
+            "text_sha256": text_sha256,
+            "reply_to_message_id": reply_to_id,
+            "authorization_code": stored_code,
+            "status": status,
+            "prepared_at": prepared_at,
+            "expires_at": expires_at_str,
+            "authorized_at": authorized_at,
+            "sent_at": sent_at,
+            "whatsapp_message_id": wa_msg_id,
+            "error_message": error_message,
+        }
     finally:
         if "conn" in locals():
             conn.close()
@@ -2812,16 +3480,22 @@ def reconcile_database(conn: sqlite3.Connection | None = None) -> dict[str, int]
             cursor.execute("SELECT 1 FROM messages WHERE id = ? AND chat_jid = ?", (wa_msg_id, chat_jid))
             if cursor.fetchone() is None:
                 ts = sent_at or prepared_at or datetime.now().astimezone().isoformat(sep=" ")
-                cursor.execute("""
+                cursor.execute(
+                    """
                     INSERT OR IGNORE INTO messages
                     (id, chat_jid, sender, content, timestamp, is_from_me, media_type, quoted_message_id)
                     VALUES (?, ?, 'Me', ?, ?, 1, NULL, ?)
-                """, (wa_msg_id, chat_jid, text, ts, reply_to))
-                cursor.execute("""
+                """,
+                    (wa_msg_id, chat_jid, text, ts, reply_to),
+                )
+                cursor.execute(
+                    """
                     UPDATE chats
                     SET last_message_time = ?
                     WHERE jid = ? AND (last_message_time IS NULL OR last_message_time < ?)
-                """, (ts, chat_jid, ts))
+                """,
+                    (ts, chat_jid, ts),
+                )
                 reconciled_audit += 1
 
         # 3. Create index for performance
@@ -2829,6 +3503,9 @@ def reconcile_database(conn: sqlite3.Connection | None = None) -> dict[str, int]
             CREATE INDEX IF NOT EXISTS idx_messages_chat_jid_timestamp
             ON messages(chat_jid, timestamp DESC)
         """)
+
+        # 4. Ensure pending read marks schema exists
+        _ensure_pending_read_marks_schema(conn)
 
         conn.commit()
         return {"updated_chats": updated_chats, "reconciled_audit": reconciled_audit}
@@ -2930,5 +3607,28 @@ def get_sync_status() -> dict[str, Any]:
         status["database_accessible"] = False
         status["inconsistencies"].append(f"Database error: {str(e)}")
 
-    return status
+    # 3. Read queue diagnostics
+    try:
+        q_status = get_read_queue_status(limit=5)
+        status["read_queue"] = {
+            "pending_count": q_status.get("pending_count", 0),
+            "completed_count": q_status.get("completed_count", 0),
+            "failed_count": q_status.get("failed_count", 0),
+            "total_count": q_status.get("total_count", 0),
+        }
+    except Exception as q_err:
+        status["read_queue"] = {"error": str(q_err)}
 
+    # 4. Bridge AppState diagnostics
+    try:
+        appstate_resp = requests.get(
+            f"{WHATSAPP_API_BASE_URL}/appstate/status",
+            headers=_bridge_headers(),
+            timeout=3,
+        )
+        if appstate_resp.status_code == 200:
+            status["app_state"] = appstate_resp.json()
+    except Exception:
+        pass
+
+    return status

@@ -17,12 +17,11 @@ Validates the full set of requirements specified in Section 11:
 """
 
 import sqlite3
-from datetime import UTC, datetime, timedelta
+from datetime import datetime
 from typing import Any
 
 import pytest
 
-import main
 import whatsapp
 
 
@@ -78,7 +77,9 @@ def mark_read_db(tmp_path, monkeypatch):
     dm_jid = "554899999999@s.whatsapp.net"
     t1 = "2026-10-07 10:00:00+00:00"
     t2 = "2026-10-07 10:05:00+00:00"
-    conn.execute("INSERT INTO chats (jid, name, last_message_time, last_read_time) VALUES (?, ?, ?, NULL)", (dm_jid, "Alice", t2))
+    conn.execute(
+        "INSERT INTO chats (jid, name, last_message_time, last_read_time) VALUES (?, ?, ?, NULL)", (dm_jid, "Alice", t2)
+    )
     conn.execute(
         "INSERT INTO messages (id, chat_jid, sender, content, timestamp, is_from_me) VALUES (?, ?, ?, ?, ?, 0)",
         ("msg-1", dm_jid, "554899999999", "hello", t1),
@@ -92,7 +93,10 @@ def mark_read_db(tmp_path, monkeypatch):
     group_jid = "120363012345678901@g.us"
     gt1 = "2026-10-07 11:00:00+00:00"
     gt2 = "2026-10-07 11:10:00+00:00"
-    conn.execute("INSERT INTO chats (jid, name, last_message_time, last_read_time) VALUES (?, ?, ?, NULL)", (group_jid, "Project Group", gt2))
+    conn.execute(
+        "INSERT INTO chats (jid, name, last_message_time, last_read_time) VALUES (?, ?, ?, NULL)",
+        (group_jid, "Project Group", gt2),
+    )
     conn.execute(
         "INSERT INTO messages (id, chat_jid, sender, content, timestamp, is_from_me) VALUES (?, ?, ?, ?, ?, 0)",
         ("g-msg-1", group_jid, "554811111111", "meeting at 2", gt1),
@@ -105,7 +109,9 @@ def mark_read_db(tmp_path, monkeypatch):
     # 3. Another unread DM for batch tests
     dm_jid2 = "554888888888@s.whatsapp.net"
     bt1 = "2026-10-07 09:00:00+00:00"
-    conn.execute("INSERT INTO chats (jid, name, last_message_time, last_read_time) VALUES (?, ?, ?, NULL)", (dm_jid2, "Bob", bt1))
+    conn.execute(
+        "INSERT INTO chats (jid, name, last_message_time, last_read_time) VALUES (?, ?, ?, NULL)", (dm_jid2, "Bob", bt1)
+    )
     conn.execute(
         "INSERT INTO messages (id, chat_jid, sender, content, timestamp, is_from_me) VALUES (?, ?, ?, ?, ?, 0)",
         ("b-msg-1", dm_jid2, "554888888888", "hey", bt1),

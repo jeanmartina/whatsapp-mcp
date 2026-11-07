@@ -15,6 +15,7 @@ from parent_watchdog import install_stdio_parent_watchdog
 from whatsapp import (
     MESSAGES_DB_PATH,
     msg_to_dict,
+    reconcile_database,
 )
 from whatsapp import (
     add_chat_to_list as whatsapp_add_chat_to_list,
@@ -53,7 +54,19 @@ from whatsapp import (
     get_message_context as whatsapp_get_message_context,
 )
 from whatsapp import (
+    get_read_queue_status as whatsapp_get_read_queue_status,
+)
+from whatsapp import (
+    get_send_status as whatsapp_get_send_status,
+)
+from whatsapp import (
     get_sender_name as whatsapp_get_sender_name,
+)
+from whatsapp import (
+    get_sync_status as whatsapp_get_sync_status,
+)
+from whatsapp import (
+    process_pending_read_marks as whatsapp_process_pending_read_marks,
 )
 from whatsapp import (
     list_chat_lists as whatsapp_list_chat_lists,
@@ -88,14 +101,26 @@ from whatsapp import (
 from whatsapp import (
     search_messages as whatsapp_search_messages,
 )
-from whatsapp import (
-    get_sync_status as whatsapp_get_sync_status,
-    reconcile_database,
+
+SERVER_INSTRUCTIONS = (
+    "WhatsApp MCP Server Guidelines:\n\n"
+    "SAFE TWO-PHASE MESSAGE SENDING:\n"
+    "To send a WhatsApp message, you MUST strictly follow this two-phase workflow:\n"
+    "1. Call prepare_send_message(chat_jid, text) to create a draft.\n"
+    "   - It returns a draft containing send_id and an authorization_code (e.g. 'ENVIAR K7M4').\n"
+    "2. Present the recipient, message text, and authorization code to the user, asking for confirmation.\n"
+    "3. When the user responds with the authorization code:\n"
+    "   - Call commit_send_message(authorization_code=code) immediately.\n"
+    "   - CRITICAL: NEVER call prepare_send_message again just because you lost or forgot send_id!\n"
+    "   - The server looks up and confirms the draft directly by authorization_code.\n"
+    "   - Calling prepare_send_message again creates a new draft with a new code and breaks the confirmation flow.\n"
+    "4. You can use get_send_status(authorization_code=code) at any time to inspect draft delivery status without sending."
 )
 
 # Initialize FastMCP server. Env-var handling is deferred to the __main__ block
 # so importing this module never parses env vars or exits the process.
-mcp = FastMCP("whatsapp")
+mcp = FastMCP("whatsapp", instructions=SERVER_INSTRUCTIONS)
+
 
 # Advertise tools listChanged capability so clients (ChatGPT, Claude, etc.) know tools can be updated
 _orig_create_initialization_options = mcp._mcp_server.create_initialization_options
@@ -471,8 +496,12 @@ def list_unread_chats(
 
 @mcp.tool()
 def mark_chat_read(
-    chat_jid: Annotated[str, Field(description="The chat JID to mark as read (e.g. '554899999999@s.whatsapp.net' or group JID)")],
-    message_id: Annotated[str | None, Field(description="Optional ID of a specific message to mark read through")] = None,
+    chat_jid: Annotated[
+        str, Field(description="The chat JID to mark as read (e.g. '554899999999@s.whatsapp.net' or group JID)")
+    ],
+    message_id: Annotated[
+        str | None, Field(description="Optional ID of a specific message to mark read through")
+    ] = None,
 ) -> dict[str, Any]:
     """Mark a WhatsApp conversation as read natively.
 
@@ -546,6 +575,12 @@ def prepare_send_message(
     The message will ONLY be dispatched if commit_send_message is subsequently called
     with the exact authorization code and server write permissions are enabled.
 
+    CRITICAL AGENT INSTRUCTIONS:
+    - Present the message text, recipient, and the confirmation code (e.g. 'ENVIAR K7M4') to the user.
+    - When the user sends back the confirmation code, immediately call commit_send_message(authorization_code=code).
+    - NEVER call prepare_send_message again upon receiving an authorization code, even if you lost send_id.
+    - The server resolves drafts directly by authorization_code. Calling prepare_send_message again resets the code!
+
     Args:
         chat_jid: Target chat JID or phone number (e.g. '554899999999@s.whatsapp.net' or group JID)
         text: Exact message text to send
@@ -563,8 +598,8 @@ def prepare_send_message(
 
 @mcp.tool()
 def commit_send_message(
-    send_id: str,
     authorization_code: str,
+    send_id: str | None = None,
 ) -> dict[str, Any]:
     """Phase 2 of safe message sending: authorize and dispatch a prepared message draft.
 
@@ -572,16 +607,45 @@ def commit_send_message(
     Requires server write permissions (WHATSAPP_WRITE_ENABLED=true) and verifies
     the single-use authorization code (e.g. 'ENVIAR K7M4') generated during Phase 1.
 
+    CRITICAL AGENT INSTRUCTIONS:
+    - When the user provides the confirmation code (e.g. 'ENVIAR K7M4'), call this tool immediately!
+    - DO NOT call prepare_send_message again just because you forgot or lost send_id!
+    - Only authorization_code is required. send_id is optional.
+    - If the message was already sent, this tool safely returns the existing confirmation without duplicating.
+
     Args:
-        send_id: ID of the prepared draft from prepare_send_message
-        authorization_code: Confirmation code (e.g. 'ENVIAR K7M4')
+        authorization_code: Confirmation code received from user (e.g. 'ENVIAR K7M4').
+        send_id: Optional draft ID from prepare_send_message (can be omitted; code is sufficient).
 
     Returns:
         Send status dictionary.
     """
     return whatsapp_commit_send_message(
-        send_id=send_id,
         authorization_code=authorization_code,
+        send_id=send_id,
+    )
+
+
+@mcp.tool()
+def get_send_status(
+    authorization_code: str | None = None,
+    send_id: str | None = None,
+) -> dict[str, Any]:
+    """Check the status of a WhatsApp message draft by confirmation code or send_id (read-only).
+
+    Use this tool to verify whether a draft is pending, sent, expired, or failed.
+    Does NOT send any messages.
+
+    Args:
+        authorization_code: Confirmation code (e.g. 'ENVIAR K7M4')
+        send_id: Optional draft ID from prepare_send_message
+
+    Returns:
+        Draft status dictionary.
+    """
+    return whatsapp_get_send_status(
+        authorization_code=authorization_code,
+        send_id=send_id,
     )
 
 
@@ -819,6 +883,29 @@ def get_sync_status() -> dict[str, Any]:
     message count, calculated activity lag, and detected sync issues.
     """
     return whatsapp_get_sync_status()
+
+
+@mcp.tool()
+def get_read_queue_status(
+    limit: Annotated[int, Field(description="Max recent queue items to return (default 20)")] = 20,
+) -> dict[str, Any]:
+    """Inspect the status of the recoverable pending read-mark queue.
+
+    Returns the count of pending, completed, and failed operations along with
+    a sanitized list of recent items without exposing sensitive message content.
+    """
+    return whatsapp_get_read_queue_status(limit=limit)
+
+
+@mcp.tool()
+def process_pending_read_marks(
+    max_items: Annotated[int, Field(description="Max pending items to process in this run (default 10)")] = 10,
+) -> dict[str, Any]:
+    """Process pending read markings in the retry queue with exponential backoff.
+
+    Attempts to mark pending chats as read and updates their retry counters and timestamps.
+    """
+    return whatsapp_process_pending_read_marks(max_items=max_items)
 
 
 def shutdown_handler(signum, frame):

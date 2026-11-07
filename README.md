@@ -260,8 +260,16 @@ Prepare a message draft and generate an authorization code.
 Authorize and execute transmission of a prepared draft.
 
 **Parameters:**
-- `send_id` (required): Draft ID returned by `prepare_send_message`
 - `authorization_code` (required): Exact authorization code (e.g., `ENVIAR K7M4`)
+- `send_id` (optional): Draft ID returned by `prepare_send_message` (can be omitted; the server resolves drafts directly by code)
+
+#### `get_send_status`
+
+Check status of a message send draft (read-only).
+
+**Parameters:**
+- `authorization_code` (optional): Exact authorization code (e.g., `ENVIAR K7M4`)
+- `send_id` (optional): Draft ID returned by `prepare_send_message`
 
 #### Recommended LLM System Prompt Instructions
 
@@ -275,9 +283,13 @@ When the user asks to send a WhatsApp message:
    - Exact text content
    - Authorization code (e.g. "ENVIAR K7M4")
 3. Tell the user: "Para confirmar o envio desta mensagem, responda com o código de autorização: `ENVIAR XXXX`".
-4. ONLY call `commit_send_message(send_id, authorization_code)` after the user explicitly types the confirmation code.
-5. If the user edits the message text or changes the recipient, discard the previous draft and call `prepare_send_message` again.
+4. When the user explicitly replies with the authorization code:
+   - Immediately call `commit_send_message(authorization_code=code)`.
+   - NEVER call `prepare_send_message` again when receiving an authorization code, even if you do not remember the `send_id`. The server resolves the draft directly by `authorization_code`.
+   - Repeated calls to `commit_send_message` safely return the existing confirmation without duplicating.
+5. If the user explicitly asks to edit the message text or change the recipient, only then call `prepare_send_message` again to generate a new draft and new code.
 ```
+
 
 #### `send_file`
 
