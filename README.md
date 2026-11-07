@@ -375,12 +375,29 @@ text a human typed, and a real message is never overwritten.
 (`whisper-cli` on `PATH`), FFmpeg, and `WHISPER_MODEL` pointing at a model
 file. Optionally `WHISPER_LANGUAGE` (default `auto`).
 
+For per-call model selection, the server operator may allowlist additional
+installed models with `WHATSAPP_TRANSCRIPTION_MODEL_MAP` (a JSON object mapping
+public aliases to local model file paths):
+
+```env
+WHATSAPP_TRANSCRIPTION_MODEL_MAP={"small":"/models/ggml-small.bin","large-v3-turbo":"/models/ggml-large-v3-turbo.bin"}
+```
+
+An MCP client can then call `transcribe_audio(message_id=..., chat_jid=...,
+model="large-v3-turbo", language="es")`. Language `auto` detects the spoken
+language rather than translating; `pt`, `es`, `en`, and `it` are supported, as
+are other two-letter language codes understood by the configured model.
+Omit `model` and `language` to use the operator's defaults. Explicit model
+aliases do **not** accept arbitrary paths and require a preinstalled model.
+
 To reuse an existing service, such as a local Parakeet server, configure:
 
 ```env
 WHATSAPP_TRANSCRIPTION_PROVIDER=openai_compatible
 WHATSAPP_TRANSCRIPTION_URL=http://127.0.0.1:8178/v1/audio/transcriptions
 WHATSAPP_TRANSCRIPTION_MODEL=parakeet
+# For per-call HTTP model selection, aliases map to approved provider model IDs:
+WHATSAPP_TRANSCRIPTION_MODEL_MAP={"parakeet":"parakeet","whisper-1":"whisper-1"}
 ```
 
 `WHATSAPP_TRANSCRIPTION_PROVIDER` defaults to `whisper_cpp`. For
@@ -398,12 +415,18 @@ after 300 seconds, and local FFmpeg decoding after 60 seconds.
 
 Stored transcripts are reused across provider changes unless `force=true`.
 Cache reads and writes use both message ID and chat JID.
+When an explicit model or language is requested for a message with an existing
+transcript, use `force=true` to replace it; the tool will otherwise report the
+stored text and request explicit confirmation of the re-transcription.
 
 **Parameters:**
 
 - `message_id` (required): ID of the message with the voice note
 - `chat_jid` (required): JID of the chat containing the message
 - `force` (optional): transcribe again even when a transcript is stored
+- `model` (optional): configured alias from `WHATSAPP_TRANSCRIPTION_MODEL_MAP`
+- `language` (optional): `auto` or an ISO 639-1 code (`pt`, `es`, `en`, `it`, etc.);
+  transcripts remain in the spoken language, without translation
 
 ### Chat Operations
 
