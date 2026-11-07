@@ -568,6 +568,7 @@ Copy `.env.example` to `.env` and configure as needed:
 | `WHATSAPP_MCP_TRANSPORT` | `stdio`                                | MCP transport to serve clients: `stdio`, `http`, or `sse` |
 | `WHATSAPP_MCP_HOST`    | `127.0.0.1`                              | Bind address for the `http`/`sse` transports |
 | `WHATSAPP_MCP_PORT`    | `8000`                                   | Port for the `http`/`sse` transports |
+| `MCP_AUTH_TOKEN`       | empty                                    | Bearer authentication token to protect remote HTTP/SSE endpoints |
 | `WHATSAPP_PARENT_WATCHDOG_S` | `30`                              | Stdio parent-liveness poll interval (seconds); exits on parent reparent only |
 
 ### MCP transport (stdio vs http/sse)
@@ -578,20 +579,45 @@ instead, set `WHATSAPP_MCP_TRANSPORT`:
 
 ```bash
 # Streamable HTTP (current spec transport for remote MCP), endpoint at /mcp
-WHATSAPP_MCP_TRANSPORT=http WHATSAPP_MCP_PORT=8000 uv run main.py
+WHATSAPP_MCP_TRANSPORT=http WHATSAPP_MCP_PORT=8000 MCP_AUTH_TOKEN=your_secure_token uv run main.py
 
 # Legacy Server-Sent Events transport (deprecated in the MCP spec), endpoint at /sse
-WHATSAPP_MCP_TRANSPORT=sse uv run main.py
+WHATSAPP_MCP_TRANSPORT=sse WHATSAPP_MCP_PORT=8000 MCP_AUTH_TOKEN=your_secure_token uv run main.py
 ```
 
 `http` is an alias for the spec's `streamable-http` transport and is the
 recommended choice for remote connections; `sse` is kept for older clients.
 
-> **Security:** `WHATSAPP_MCP_HOST` defaults to `127.0.0.1`, so the HTTP/SSE
-> server is reachable only from the local machine. The server has no built-in
-> authentication, and the underlying bridge can read and send WhatsApp messages
-> on your account. Only bind to a non-loopback address (e.g. `0.0.0.0`) if you
-> place an authenticating reverse proxy or tunnel in front of it.
+> **Security & Authentication:** When serving over HTTP/SSE, you can configure
+> `MCP_AUTH_TOKEN` to protect the server with Bearer token authentication
+> (`Authorization: Bearer <token>`, `?token=<token>`, or path prefix `/<token>`).
+> All unauthenticated requests to MCP endpoints will be rejected with `401 Unauthorized`.
+> Health check probes (`GET /health`) remain open for orchestrators.
+
+### Connecting with ChatGPT
+
+To connect this MCP server to ChatGPT (via Custom GPT or Actions):
+1. **Server Transport:** Start the server with `WHATSAPP_MCP_TRANSPORT=http` and set `MCP_AUTH_TOKEN`.
+2. **Endpoint:** Expose via your secure HTTPS reverse proxy (e.g. `https://your-domain.com/mcp`).
+3. **Authentication:** Configure `Bearer Token` in ChatGPT matching your `MCP_AUTH_TOKEN`.
+
+### Configuring Cursor (`.cursor/mcp.json`)
+
+```json
+{
+  "mcpServers": {
+    "whatsapp": {
+      "command": "uv",
+      "args": ["run", "--directory", "/absolute/path/to/whatsapp-mcp/whatsapp-mcp-server", "main.py"],
+      "env": {
+        "WHATSAPP_API_URL": "http://localhost:8080/api",
+        "WHATSAPP_DB_PATH": "/absolute/path/to/whatsapp-mcp/whatsapp-bridge/store/messages.db",
+        "WHATSMEOW_DB_PATH": "/absolute/path/to/whatsapp-mcp/whatsapp-bridge/store/whatsapp.db"
+      }
+    }
+  }
+}
+```
 
 ### Bridge authentication and media paths
 

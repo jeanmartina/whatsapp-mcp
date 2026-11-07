@@ -908,12 +908,12 @@ def process_pending_read_marks(
     return whatsapp_process_pending_read_marks(max_items=max_items)
 
 
-def create_asgi_app(mount_path: str = "/mcp/whatsapp", auth_token: str | None = None) -> Any:
+def create_asgi_app(mount_path: str = "", auth_token: str | None = None) -> Any:
     """Create a unified ASGI application supporting both SSE and Streamable HTTP transports.
 
     Serves:
-    - SSE: /sse, /messages (and mounted at {mount_path}/sse, {mount_path}/messages)
-    - Streamable HTTP: /mcp, / (and mounted at {mount_path}/mcp, {mount_path})
+    - SSE: /sse, /messages (and mounted at {mount_path}/sse, {mount_path}/messages when configured)
+    - Streamable HTTP: /mcp, / (and mounted at {mount_path}/mcp, {mount_path} when configured)
     - Health checks: GET /health, GET / (and mounted at {mount_path}/health, {mount_path})
     - Authentication: Bearer token in Authorization header, ?token=<token> in query,
       or /<token> prefix in path when auth_token is configured.
@@ -1089,8 +1089,8 @@ if __name__ == "__main__":
         import uvicorn
         from urllib.parse import urlparse
 
-        public_base_url = os.getenv("PUBLIC_BASE_URL", "https://n8n.labsec.ufsc.br/mcp/whatsapp")
-        public_mount_path = urlparse(public_base_url).path.rstrip("/") or "/mcp/whatsapp"
+        public_base_url = os.getenv("PUBLIC_BASE_URL", "")
+        public_mount_path = urlparse(public_base_url).path.rstrip("/") if public_base_url else os.getenv("MCP_MOUNT_PATH", "")
         auth_token = os.getenv("MCP_AUTH_TOKEN")
 
         asgi_app = create_asgi_app(mount_path=public_mount_path, auth_token=auth_token)
