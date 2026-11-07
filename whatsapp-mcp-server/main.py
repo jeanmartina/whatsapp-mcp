@@ -807,7 +807,13 @@ def view_media(
 
 
 @mcp.tool()
-def transcribe_audio(message_id: str, chat_jid: str, force: bool = False) -> dict[str, Any]:
+def transcribe_audio(
+    message_id: str,
+    chat_jid: str,
+    force: bool = False,
+    model: str | None = None,
+    language: str | None = None,
+) -> dict[str, Any]:
     """Transcribe a WhatsApp voice note and return its text.
 
     Runs whisper.cpp locally by default, or sends audio to the operator's
@@ -824,6 +830,11 @@ def transcribe_audio(message_id: str, chat_jid: str, force: bool = False) -> dic
         message_id: The ID of the message containing the voice note
         chat_jid: The JID of the chat containing the message
         force: Transcribe again even when a transcript is already stored
+        model: Optional alias from WHATSAPP_TRANSCRIPTION_MODEL_MAP, e.g. large-v3-turbo.
+            Aliases must be preconfigured by the server operator; never pass a file path.
+        language: Optional language code, e.g. auto, pt, es, en, it. Omit to use
+            the server default. Auto detects the original spoken language and does
+            not translate it. Use force=true to replace an existing transcript.
 
     Returns:
         A dictionary with success status and the transcript
@@ -831,6 +842,12 @@ def transcribe_audio(message_id: str, chat_jid: str, force: bool = False) -> dic
     if not force:
         existing = transcription.stored_transcript(MESSAGES_DB_PATH, message_id, chat_jid)
         if existing:
+            if model is not None or language is not None:
+                return {
+                    "success": False,
+                    "message": "Transcript already stored. Set force=true to use a requested model or language.",
+                    "transcript": existing,
+                }
             return {"success": True, "message": "Transcript already stored", "transcript": existing}
 
     # WhatsApp expires media server-side after a few weeks, so the file has to
@@ -853,25 +870,38 @@ def transcribe_audio(message_id: str, chat_jid: str, force: bool = False) -> dic
 
     try:
         provider = transcription.provider_name()
-        model = transcription.configured_model(provider)
+        selected_model = transcription.select_model(provider, model)
+        selected_language = transcription.select_language(provider, language)
         with tempfile.TemporaryDirectory() as work_dir:
-            text = transcription.transcribe_file(file_path, work_dir, model=model, provider=provider)
+            text = transcription.transcribe_file(
+                file_path,
+                work_dir,
+                model=selected_model,
+                provider=provider,
+                language_override=selected_language,
+            )
     except transcription.TranscriptionError as exc:
         return {"success": False, "message": str(exc)}
 
-    if not transcription.store_transcript(MESSAGES_DB_PATH, message_id, chat_jid, text, model, provider=provider):
+    if not transcription.store_transcript(
+        MESSAGES_DB_PATH, message_id, chat_jid, text, selected_model, provider=provider
+    ):
         # The words are worth returning even when the row could not be updated,
         # but say so: without the row, list_messages will not show them.
         return {
             "success": True,
             "message": "Transcribed, but the transcript could not be stored on the message row",
             "transcript": text,
+            "model": model or transcription.display_model(selected_model, provider),
+            "language": selected_language,
         }
 
     return {
         "success": True,
         "message": "Transcribed",
-        "transcript": f"{transcription.label(model, provider)}{text}",
+        "transcript": f"{transcription.label(selected_model, provider)}{text}",
+        "model": model or transcription.display_model(selected_model, provider),
+        "language": selected_language,
     }
 
 

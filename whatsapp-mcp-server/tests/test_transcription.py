@@ -6,6 +6,7 @@ database write that failed silently left the text on disk but invisible to
 clients — which is indistinguishable from "this note was never transcribed".
 """
 
+import json
 import sqlite3
 import subprocess
 from unittest.mock import Mock
@@ -17,7 +18,7 @@ import transcription
 
 @pytest.fixture(autouse=True)
 def clean_transcription_config(monkeypatch):
-    for name in ("PROVIDER", "URL", "MODEL", "LANGUAGE", "API_KEY"):
+    for name in ("PROVIDER", "URL", "MODEL", "MODEL_MAP", "LANGUAGE", "API_KEY"):
         monkeypatch.delenv(f"WHATSAPP_TRANSCRIPTION_{name}", raising=False)
     monkeypatch.delenv("WHISPER_LANGUAGE", raising=False)
 
@@ -146,6 +147,48 @@ def test_model_pointing_nowhere_is_reported(monkeypatch, tmp_path):
         transcription.model_path()
 
 
+def test_model_selection_only_allows_operator_configured_aliases(monkeypatch, tmp_path):
+    installed = tmp_path / "ggml-large-v3-turbo.bin"
+    installed.write_bytes(b"test model")
+    monkeypatch.setenv("WHATSAPP_TRANSCRIPTION_MODEL_MAP", json.dumps({"large-v3-turbo": str(installed)}))
+    assert transcription.select_model("whisper_cpp", "large-v3-turbo") == str(installed)
+    for rejected in ("../private", "/etc/passwd", "small;curl", "small"):
+        with pytest.raises(transcription.TranscriptionError):
+            transcription.select_model("whisper_cpp", rejected)
+
+
+def test_model_allowlist_validates_configuration(monkeypatch, tmp_path):
+    monkeypatch.setenv("WHATSAPP_TRANSCRIPTION_MODEL_MAP", "not json")
+    with pytest.raises(transcription.TranscriptionError, match="JSON object"):
+        transcription.select_model("whisper_cpp", "small")
+    monkeypatch.setenv("WHATSAPP_TRANSCRIPTION_MODEL_MAP", '["small"]')
+    with pytest.raises(transcription.TranscriptionError, match="JSON object"):
+        transcription.select_model("whisper_cpp", "small")
+    monkeypatch.setenv("WHATSAPP_TRANSCRIPTION_MODEL_MAP", json.dumps({"small": str(tmp_path / "missing.bin")}))
+    with pytest.raises(transcription.TranscriptionError, match="installed file"):
+        transcription.select_model("whisper_cpp", "small")
+
+
+def test_http_model_selection_is_limited_to_configured_provider_ids(monkeypatch):
+    monkeypatch.setenv("WHATSAPP_TRANSCRIPTION_MODEL_MAP", '{"fast":"whisper-1"}')
+    assert transcription.select_model("openai_compatible", "fast") == "whisper-1"
+    with pytest.raises(transcription.TranscriptionError):
+        transcription.select_model("openai_compatible", "unapproved")
+
+
+@pytest.mark.parametrize(
+    "provided,expected", [("auto", "auto"), ("pt", "pt"), ("ES", "es"), ("en", "en"), ("it", "it")]
+)
+def test_per_call_language_selection(provided, expected):
+    assert transcription.select_language("whisper_cpp", provided) == expected
+
+
+@pytest.mark.parametrize("provided", ["spanish", "pt-BR", "", ";rm -rf", "abc", "3n"])
+def test_invalid_language_is_rejected(provided):
+    with pytest.raises(transcription.TranscriptionError, match="language"):
+        transcription.select_language("whisper_cpp", provided)
+
+
 def test_output_is_collapsed_to_one_line():
     assert transcription.normalise(" a\n b \n\n c \n") == "a b c"
 
@@ -175,6 +218,24 @@ def test_transcribe_file_returns_recognised_text(tmp_path, monkeypatch):
 
     monkeypatch.setattr(transcription.subprocess, "run", fake_run)
     assert transcription.transcribe_file(audio, tmp_path, model="m.bin") == "recognised words"
+
+
+def test_local_transcription_uses_selected_language(tmp_path, monkeypatch):
+    audio = tmp_path / "audio.ogg"
+    audio.write_bytes(b"opus")
+    monkeypatch.setattr(transcription.shutil, "which", lambda _tool: "/usr/bin/tool")
+    commands = []
+
+    def fake_run(command, **_kwargs):
+        commands.append(command)
+        if command[0] == "ffmpeg":
+            transcription.Path(command[-1]).write_bytes(b"wav")
+            return subprocess.CompletedProcess(command, 0, b"", b"")
+        return subprocess.CompletedProcess(command, 0, b"hola", b"")
+
+    monkeypatch.setattr(transcription.subprocess, "run", fake_run)
+    assert transcription.transcribe_file(audio, tmp_path, model="m.bin", language_override="es") == "hola"
+    assert commands[1][commands[1].index("-l") + 1] == "es"
 
 
 def test_transcribe_file_surfaces_a_decode_failure(tmp_path, monkeypatch):
@@ -297,6 +358,25 @@ def test_tool_dispatches_stores_and_reuses_chat_scoped_transcript(db, http_provi
     monkeypatch.setenv("WHATSAPP_TRANSCRIPTION_PROVIDER", "openai_compatible")
     assert main.transcribe_audio("voice1", "chat@g.us", force=True)["success"]
     assert post.call_count == 2
+
+
+def test_tool_selects_model_language_without_arbitrary_network_target(db, http_provider, monkeypatch):
+    import main
+
+    audio, post, _response = http_provider
+    monkeypatch.setattr(main, "MESSAGES_DB_PATH", db)
+    monkeypatch.setattr(main, "whatsapp_download_media", Mock(return_value=str(audio)))
+    monkeypatch.setenv("WHATSAPP_TRANSCRIPTION_MODEL_MAP", '{"accurate":"whisper-1"}')
+    result = main.transcribe_audio("voice1", "chat@g.us", model="accurate", language="it")
+    assert result["success"] and result["model"] == "accurate" and result["language"] == "it"
+    assert post.call_args.kwargs["data"]["model"] == "whisper-1"
+    assert post.call_args.kwargs["data"]["language"] == "it"
+    cached = main.transcribe_audio("voice1", "chat@g.us", model="accurate", language="es")
+    assert not cached["success"] and "force=true" in cached["message"]
+    assert post.call_count == 1
+    retried = main.transcribe_audio("voice1", "chat@g.us", force=True, model="accurate", language="es")
+    assert retried["success"] and retried["language"] == "es"
+    assert post.call_args.kwargs["data"]["language"] == "es"
 
 
 def test_subprocess_timeout_becomes_tool_error(monkeypatch):
