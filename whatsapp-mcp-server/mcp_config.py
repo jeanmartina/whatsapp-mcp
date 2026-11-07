@@ -8,6 +8,8 @@ TRANSPORT_ALIASES = {
     "streamable-http": "streamable-http",
     "streamable_http": "streamable-http",
     "sse": "sse",
+    "dual": "streamable-http",
+    "all": "streamable-http",
 }
 DEFAULT_MCP_HOST = "127.0.0.1"
 DEFAULT_MCP_PORT = 8000

@@ -908,6 +908,149 @@ def process_pending_read_marks(
     return whatsapp_process_pending_read_marks(max_items=max_items)
 
 
+def create_asgi_app(mount_path: str = "/mcp/whatsapp", auth_token: str | None = None) -> Any:
+    """Create a unified ASGI application supporting both SSE and Streamable HTTP transports.
+
+    Serves:
+    - SSE: /sse, /messages (and mounted at {mount_path}/sse, {mount_path}/messages)
+    - Streamable HTTP: /mcp, / (and mounted at {mount_path}/mcp, {mount_path})
+    - Health checks: GET /health, GET / (and mounted at {mount_path}/health, {mount_path})
+    - Authentication: Bearer token in Authorization header, ?token=<token> in query,
+      or /<token> prefix in path when auth_token is configured.
+    """
+    from urllib.parse import parse_qs
+    from starlette.applications import Starlette
+    from starlette.middleware.cors import CORSMiddleware
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse, Response
+    from starlette.routing import Mount, Route
+
+    # Disable DNS rebinding protection since the server runs behind reverse proxy (Traefik)
+    mcp.settings.transport_security.enable_dns_rebinding_protection = False
+
+    clean_mount = "/" + mount_path.strip("/") if mount_path and mount_path.strip("/") else ""
+
+    sse_app = mcp.sse_app(mount_path=clean_mount or "/")
+    mcp.streamable_http_app()
+
+    sse_route = [r for r in sse_app.routes if getattr(r, "path", "") == "/sse"][0]
+    messages_mount = [r for r in sse_app.routes if getattr(r, "path", "") == "/messages"][0]
+
+    class DynamicStreamApp:
+        async def __call__(self, scope, receive, send):
+            await mcp.session_manager.handle_request(scope, receive, send)
+
+    stream_endpoint = DynamicStreamApp()
+
+    class HealthOrStreamHandler:
+        async def __call__(self, scope, receive, send):
+            if scope["type"] == "http":
+                method = scope.get("method")
+                if method == "POST":
+                    await stream_endpoint(scope, receive, send)
+                    return
+                headers = dict(scope.get("headers", []))
+                accept = headers.get(b"accept", b"").decode("latin1")
+                if "text/event-stream" in accept:
+                    req = Request(scope, receive, send)
+                    res = await sse_route.endpoint(req)
+                    await res(scope, receive, send)
+                    return
+                sse_ep = f"{clean_mount}/sse" if clean_mount else "/sse"
+                res = JSONResponse({"status": "healthy", "service": "whatsapp-mcp", "sse_endpoint": sse_ep})
+                await res(scope, receive, send)
+                return
+            await stream_endpoint(scope, receive, send)
+
+    routes = [
+        # SSE endpoints
+        Route("/sse", endpoint=sse_route.endpoint, methods=["GET"]),
+        messages_mount,
+        # Streamable HTTP endpoints
+        Route("/mcp", endpoint=stream_endpoint, methods=["POST", "GET"]),
+        Route("/health", endpoint=HealthOrStreamHandler(), methods=["GET"]),
+        Route("/", endpoint=HealthOrStreamHandler()),
+    ]
+
+    if clean_mount:
+        routes.extend([
+            Route(f"{clean_mount}/sse", endpoint=sse_route.endpoint, methods=["GET"]),
+            Mount(f"{clean_mount}/messages", app=messages_mount.app),
+            Route(f"{clean_mount}/mcp", endpoint=stream_endpoint, methods=["POST", "GET"]),
+            Route(f"{clean_mount}/health", endpoint=HealthOrStreamHandler(), methods=["GET"]),
+            Route(clean_mount, endpoint=HealthOrStreamHandler()),
+        ])
+
+    import contextlib
+
+    @contextlib.asynccontextmanager
+    async def lifespan_wrapper(application):
+        if getattr(mcp.session_manager, "_has_started", False):
+            mcp._session_manager = None
+            mcp.streamable_http_app()
+        async with mcp.session_manager.run():
+            yield
+
+    app = Starlette(
+        routes=routes,
+        lifespan=lifespan_wrapper,
+    )
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    if auth_token:
+        class BearerAuthMiddleware:
+            def __init__(self, inner, token: str):
+                self.inner = inner
+                self.token = token
+
+            async def __call__(self, scope, receive, send):
+                if scope["type"] == "http":
+                    headers = dict(scope.get("headers", []))
+                    auth = headers.get(b"authorization", b"").decode("latin1").strip()
+                    path = scope.get("path", "")
+                    qs = parse_qs(scope.get("query_string", b"").decode("latin1"))
+                    query_token = qs.get("token", [None])[0]
+
+                    token_prefix = f"/{self.token}"
+                    path_has_token = path == token_prefix or path.startswith(f"{token_prefix}/")
+
+                    health_paths = {"/", "", "/health"}
+                    if clean_mount:
+                        health_paths.update({clean_mount, f"{clean_mount}/", f"{clean_mount}/health"})
+
+                    is_health_check = (path in health_paths) and (
+                        scope.get("method") in ("GET", "HEAD") and b"text/event-stream" not in headers.get(b"accept", b"")
+                    )
+
+                    is_messages_session = path in ("/messages", f"{clean_mount}/messages") or path.startswith("/messages/") or (
+                        bool(clean_mount) and path.startswith(f"{clean_mount}/messages/")
+                    )
+
+                    if not is_health_check and not is_messages_session:
+                        if auth != f"Bearer {self.token}" and query_token != self.token and not path_has_token:
+                            res = Response("Unauthorized\n", status_code=401, headers={"WWW-Authenticate": "Bearer", "Content-Type": "text/plain; charset=utf-8"})
+                            await res(scope, receive, send)
+                            return
+
+                    if path_has_token:
+                        scope = dict(scope)
+                        stripped = path[len(token_prefix):]
+                        scope["path"] = stripped if stripped else "/"
+
+                await self.inner(scope, receive, send)
+
+        return BearerAuthMiddleware(app, auth_token)
+
+    return app
+
+
 def shutdown_handler(signum, frame):
     """Handle shutdown signals gracefully to prevent zombie processes."""
     sys.exit(0)
@@ -941,4 +1084,20 @@ if __name__ == "__main__":
 
     if transport == "stdio":
         install_stdio_parent_watchdog("WHATSAPP_PARENT_WATCHDOG_S", parent_pid=parent_pid)
-    mcp.run(transport=transport)
+        mcp.run(transport=transport)
+    else:
+        import uvicorn
+        from urllib.parse import urlparse
+
+        public_base_url = os.getenv("PUBLIC_BASE_URL", "https://n8n.labsec.ufsc.br/mcp/whatsapp")
+        public_mount_path = urlparse(public_base_url).path.rstrip("/") or "/mcp/whatsapp"
+        auth_token = os.getenv("MCP_AUTH_TOKEN")
+
+        asgi_app = create_asgi_app(mount_path=public_mount_path, auth_token=auth_token)
+
+        uvicorn.run(
+            asgi_app,
+            host=mcp.settings.host,
+            port=mcp.settings.port,
+            log_level=mcp.settings.log_level.lower(),
+        )
