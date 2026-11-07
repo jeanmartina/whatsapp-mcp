@@ -113,6 +113,7 @@ A failing blocking job is a hard block — fix it or explain in the PR why it's 
 | `WHATSAPP_PARENT_WATCHDOG_S` | `30` | Stdio parent-liveness poll interval (seconds). Exits when the original parent is gone (POSIX reparent). Soft stdin EOF alone does not exit. |
 | `WHISPER_MODEL` | unset | Required model-file path for default whisper.cpp transcription |
 | `WHISPER_LANGUAGE` | `auto` | Language for whisper.cpp transcription |
+| `WHATSAPP_TRANSCRIPTION_MODEL_MAP` | `{}` | JSON map of MCP-selectable model aliases to installed whisper.cpp paths or HTTP provider IDs; never tool-supplied arbitrary paths |
 | `WHATSAPP_TRANSCRIPTION_PROVIDER` | `whisper_cpp` | `whisper_cpp` or `openai_compatible`; transcription is opt-in via the tool |
 | `WHATSAPP_TRANSCRIPTION_URL` | unset | Required full HTTP(S) endpoint for `openai_compatible`; audio is uploaded here, use loopback to keep it local |
 | `WHATSAPP_TRANSCRIPTION_MODEL` | unset | Required model ID for the HTTP provider (e.g. `parakeet`) |
