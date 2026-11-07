@@ -3451,10 +3451,10 @@ func main() {
 					appstate.WAPatchRegularLow,
 					appstate.WAPatchRegularHigh,
 				} {
-					if err := client.FetchAppState(ctx, patch, true, false); err != nil {
+					if err := client.FetchAppState(ctx, patch, false, false); err != nil {
 						logger.Warnf("Failed to fetch %s app state: %v", patch, err)
 					} else {
-						logger.Infof("✓ %s app state full sync complete", patch)
+						logger.Infof("✓ %s app state sync complete", patch)
 					}
 				}
 			}()

@@ -40,6 +40,8 @@ type MarkChatReadResponse struct {
 	NewLastReadTime             *string `json:"new_last_read_time,omitempty"`
 	Unread                      bool    `json:"unread"`
 	Status                      string  `json:"status,omitempty"`
+	RemoteSynced                bool    `json:"remote_synced"`
+	AppStateError               string  `json:"app_state_error,omitempty"`
 	Error                       string  `json:"error,omitempty"`
 }
 
@@ -498,11 +500,12 @@ func handleMarkChatRead(
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		_ = json.NewEncoder(w).Encode(MarkChatReadResponse{
-			Success: false,
-			ChatJID: req.ChatJID,
-			Status:  "internal_error",
-			Error:   fmt.Sprintf("Failed to sync app state with WhatsApp: %v", sendErr),
-			Unread:  isUnread,
+			Success:      false,
+			ChatJID:      req.ChatJID,
+			Status:       "internal_error",
+			Error:        fmt.Sprintf("Failed to sync app state with WhatsApp: %v", sendErr),
+			Unread:       isUnread,
+			RemoteSynced: false,
 		})
 		return
 	}
@@ -537,5 +540,7 @@ func handleMarkChatRead(
 		PreviousLastReadTime:        prevLastReadStr,
 		NewLastReadTime:             newLastReadStr,
 		Unread:                      isUnread,
+		Status:                      "read",
+		RemoteSynced:                true,
 	})
 }

@@ -496,8 +496,8 @@ func TestSendAppStateWithRecovery_Conflict409Recovery(t *testing.T) {
 	if len(mockCli.fetchAppStateCalls) != 1 {
 		t.Fatalf("expected 1 FetchAppState call for resync, got %d", len(mockCli.fetchAppStateCalls))
 	}
-	if !mockCli.fetchAppStateCalls[0].fullSync {
-		t.Fatalf("expected fullSync = true in FetchAppState call")
+	if mockCli.fetchAppStateCalls[0].fullSync {
+		t.Fatalf("expected fullSync = false in FetchAppState call")
 	}
 	if mockCli.fetchAppStateCalls[0].name != appstate.WAPatchRegularLow {
 		t.Fatalf("expected patch name regular_low, got %s", mockCli.fetchAppStateCalls[0].name)

@@ -114,8 +114,8 @@ func (m *AppStateManager) SendAppStateWithRecovery(
 	for attempt := 1; attempt <= m.maxRetries; attempt++ {
 		m.diagnostics.RecoveriesAttempted++
 
-		// Trigger official full snapshot resync without destroying session or disabling crypto checks
-		resyncErr := cli.FetchAppState(ctx, patch.Type, true, false)
+		// Trigger official incremental snapshot resync without destroying session, wiping versions, or disabling crypto checks
+		resyncErr := cli.FetchAppState(ctx, patch.Type, false, false)
 		if resyncErr != nil {
 			m.diagnostics.RecoveriesFailed++
 			m.diagnostics.LastError = fmt.Sprintf("FetchAppState failed (attempt %d): %v", attempt, resyncErr)

@@ -1487,10 +1487,21 @@ def mark_chat_read(
             f"{WHATSAPP_API_BASE_URL}/chats/mark-read",
             json=payload,
             headers=_bridge_headers(),
-            timeout=15,
+            timeout=35,
         )
         if response.status_code == 200:
-            return response.json()
+            data = response.json()
+            if data.get("status") == "pending_queued" or data.get("remote_synced") is False:
+                try:
+                    enqueue_res = enqueue_pending_read_mark(
+                        chat_jid_clean,
+                        message_id=message_id_clean or data.get("marked_read_through_message_id"),
+                        last_error=data.get("app_state_error", "App state remote sync pending"),
+                    )
+                    data["queue_id"] = enqueue_res.get("queue_id")
+                except Exception as q_err:
+                    print(f"Warning: failed to enqueue pending read mark: {q_err}")
+            return data
 
         chat = get_chat(chat_jid_clean, include_last_message=True)
         current_unread = chat.get("unread", True) if isinstance(chat, dict) else True
@@ -3170,7 +3181,7 @@ def commit_send_message(
                 url,
                 json=payload,
                 headers=_bridge_headers(),
-                timeout=15,
+                timeout=30,
             )
             if resp.status_code == 200:
                 data = resp.json()
