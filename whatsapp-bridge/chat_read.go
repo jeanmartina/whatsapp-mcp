@@ -494,23 +494,9 @@ func handleMarkChatRead(
 	}
 
 	patch := appstate.BuildMarkChatAsRead(resolvedChatJID, true, readThroughTimestamp, lastMessageKey)
-	if sendErr := globalAppStateManager.SendAppStateWithRecovery(r.Context(), cli, patch); sendErr != nil {
-		fmt.Printf("Warning: failed to send app state mark-read patch for %s: %v\n", req.ChatJID, sendErr)
-		isUnread, _ := messageStore.IsChatUnread(req.ChatJID)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		_ = json.NewEncoder(w).Encode(MarkChatReadResponse{
-			Success:      false,
-			ChatJID:      req.ChatJID,
-			Status:       "internal_error",
-			Error:        fmt.Sprintf("Failed to sync app state with WhatsApp: %v", sendErr),
-			Unread:       isUnread,
-			RemoteSynced: false,
-		})
-		return
-	}
+	sendErr := globalAppStateManager.SendAppStateWithRecovery(r.Context(), cli, patch)
 
-	// 3. Persist local read marker in database
+	// 3. Persist local read marker in database since read receipts were already sent
 	if markErr := messageStore.MarkChatRead(req.ChatJID, readThroughTimestamp); markErr != nil {
 		fmt.Printf("Warning: failed to update local read marker for %s: %v\n", req.ChatJID, markErr)
 	}
@@ -532,6 +518,23 @@ func handleMarkChatRead(
 	readThroughTimestampStr := &tsStr
 
 	w.Header().Set("Content-Type", "application/json")
+	if sendErr != nil {
+		fmt.Printf("Warning: failed to send app state mark-read patch for %s: %v. Local read marked, enqueued for recovery.\n", req.ChatJID, sendErr)
+		_ = json.NewEncoder(w).Encode(MarkChatReadResponse{
+			Success:                     true,
+			ChatJID:                     req.ChatJID,
+			MarkedReadThroughMessageID:  readThroughMsgID,
+			MarkedReadThroughTimestamp: readThroughTimestampStr,
+			PreviousLastReadTime:        prevLastReadStr,
+			NewLastReadTime:             newLastReadStr,
+			Unread:                      isUnread,
+			Status:                      "pending_queued",
+			RemoteSynced:                false,
+			AppStateError:               sendErr.Error(),
+		})
+		return
+	}
+
 	_ = json.NewEncoder(w).Encode(MarkChatReadResponse{
 		Success:                     true,
 		ChatJID:                     req.ChatJID,

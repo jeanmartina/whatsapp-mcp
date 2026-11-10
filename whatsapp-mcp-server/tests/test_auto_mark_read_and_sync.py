@@ -502,3 +502,170 @@ def test_scenario_9_consistency_between_db_and_whatsapp_state(temp_db, monkeypat
     c.execute("SELECT last_read_time FROM chats WHERE jid = ?", (chat_jid,))
     assert c.fetchone()[0] is None
     conn.close()
+
+
+def test_scenario_10_appstate_pending_queued_contract(temp_db, monkeypatch):
+    """10. Contrato de bridge retornando pending_queued quando recibos foram enviados mas AppState divergiu."""
+    monkeypatch.setenv("WHATSAPP_WRITE_ENABLED", "true")
+    monkeypatch.setenv("WHATSAPP_MARK_READ_ENABLED", "true")
+
+    chat_jid = "554899000001@s.whatsapp.net"
+    seed_chat_and_inbound_message(temp_db, chat_jid, "msg_in_10", "2026-11-07 11:00:00")
+
+    draft = whatsapp.prepare_send_message(chat_jid=chat_jid, text="Resposta 10")
+    auth_code = draft["authorization_code"]
+
+    def mock_post(url, json=None, headers=None, timeout=None):
+        if "/send" in url:
+            return DummyResponse(200, {"success": True, "message_id": "out_10"})
+        elif "/chats/mark-read" in url:
+            return DummyResponse(200, {
+                "success": True,
+                "chat_jid": chat_jid,
+                "marked_read_through_message_id": "msg_in_10",
+                "status": "pending_queued",
+                "remote_synced": False,
+                "app_state_error": "409 conflict: mismatching LTHash",
+                "unread": False,
+            })
+        return DummyResponse(404, {})
+
+    monkeypatch.setattr(whatsapp.requests, "post", mock_post)
+
+    res = whatsapp.commit_send_message(authorization_code=auth_code)
+
+    assert res["success"] is True
+    assert res["status"] == "sent"
+    assert res["message_sent"] is True
+    assert res["read_marked"] is True
+    assert res["read_status"] == "pending_queued"
+    assert "409 conflict" in res["read_error"]
+
+    # Verify item was enqueued in pending_read_marks
+    q_status = whatsapp.get_read_queue_status()
+    assert q_status["pending_count"] == 1
+    assert q_status["oldest_pending_created_at"] is not None
+    assert q_status["oldest_pending_age_seconds"] is not None
+    assert q_status["oldest_pending_age_seconds"] >= 0.0
+
+    # Ensure queue_id was stored properly without AttributeError
+    item = q_status["items"][0]
+    assert item["chat_jid"] == chat_jid
+    assert item["message_id"] == "msg_in_10"
+    assert item["status"] == "pending"
+
+
+def test_scenario_11_process_pending_read_marks_exponential_backoff(temp_db, monkeypatch):
+    """11. Backoff exponencial e limites de retentativa na fila de recuperacao."""
+    monkeypatch.setenv("WHATSAPP_WRITE_ENABLED", "true")
+    monkeypatch.setenv("WHATSAPP_MARK_READ_ENABLED", "true")
+
+    chat_jid = "554899000002@s.whatsapp.net"
+    seed_chat_and_inbound_message(temp_db, chat_jid, "msg_in_11", "2026-11-07 11:10:00")
+
+    # Enqueue with max_retries = 2
+    item_id = whatsapp.enqueue_pending_read_mark(chat_jid, message_id="msg_in_11", max_retries=2)
+    assert isinstance(item_id, int)
+
+    # Mock mark_chat_read to always report remote_synced=False (app state still failing)
+    def mock_post(url, json=None, headers=None, timeout=None):
+        if "/chats/mark-read" in url:
+            return DummyResponse(200, {
+                "success": True,
+                "status": "pending_queued",
+                "remote_synced": False,
+                "app_state_error": "409 conflict",
+            })
+        return DummyResponse(404, {})
+
+    monkeypatch.setattr(whatsapp.requests, "post", mock_post)
+
+    # First attempt: processed, fails remote sync, sets next_retry_at in future
+    proc1 = whatsapp.process_pending_read_marks()
+    assert proc1["processed"] == 1
+    assert proc1["succeeded"] == 0
+    assert proc1["failed"] == 0
+
+    # Immediate second run: processes 0 because next_retry_at is in the future
+    proc2 = whatsapp.process_pending_read_marks()
+    assert proc2["processed"] == 0
+
+    # Fast forward next_retry_at in DB
+    conn = sqlite3.connect(temp_db)
+    past_str = (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
+    conn.execute("UPDATE pending_read_marks SET next_retry_at = ?", (past_str,))
+    conn.commit()
+    conn.close()
+
+    # Second attempt: reaches max_retries (2) -> transitions to status: 'failed'
+    proc3 = whatsapp.process_pending_read_marks()
+    assert proc3["processed"] == 1
+    assert proc3["failed"] == 1
+
+    q_status = whatsapp.get_read_queue_status()
+    assert q_status["failed_count"] == 1
+    assert q_status["items"][0]["status"] == "failed"
+
+
+def test_scenario_12_bridge_unreachable_enqueues_pending_read_mark(temp_db, monkeypatch):
+    """12. Enfileiramento automatico quando a bridge esta inacessivel."""
+    monkeypatch.setenv("WHATSAPP_WRITE_ENABLED", "true")
+    monkeypatch.setenv("WHATSAPP_MARK_READ_ENABLED", "true")
+
+    chat_jid = "554899000003@s.whatsapp.net"
+    seed_chat_and_inbound_message(temp_db, chat_jid, "msg_in_12", "2026-11-07 11:20:00")
+
+    def mock_post(url, json=None, headers=None, timeout=None):
+        raise whatsapp.requests.RequestException("Bridge down")
+
+    monkeypatch.setattr(whatsapp.requests, "post", mock_post)
+
+    res = whatsapp.mark_chat_read(chat_jid, message_id="msg_in_12")
+    assert res["success"] is False
+    assert res["status"] == "unavailable"
+
+    # Must be in queue
+    q_status = whatsapp.get_read_queue_status()
+    assert q_status["pending_count"] == 1
+    assert q_status["items"][0]["chat_jid"] == chat_jid
+
+
+def test_scenario_13_never_resend_message_on_read_failure(temp_db, monkeypatch):
+    """13. Garantia absoluta de nao reenviar mensagens em falhas de leitura."""
+    monkeypatch.setenv("WHATSAPP_WRITE_ENABLED", "true")
+    monkeypatch.setenv("WHATSAPP_MARK_READ_ENABLED", "true")
+
+    chat_jid = "554899000004@s.whatsapp.net"
+    seed_chat_and_inbound_message(temp_db, chat_jid, "msg_in_13", "2026-11-07 11:30:00")
+
+    draft = whatsapp.prepare_send_message(chat_jid=chat_jid, text="Mensagem de teste anti-duplicacao")
+    auth_code = draft["authorization_code"]
+
+    send_calls = 0
+
+    def mock_post(url, json=None, headers=None, timeout=None):
+        nonlocal send_calls
+        if "/send" in url:
+            send_calls += 1
+            return DummyResponse(200, {"success": True, "message_id": "wa_msg_unique_13"})
+        elif "/chats/mark-read" in url:
+            # Fatal error during read marking
+            return DummyResponse(500, {"success": False, "error": "Fatal crash during app state"})
+        return DummyResponse(404, {})
+
+    monkeypatch.setattr(whatsapp.requests, "post", mock_post)
+
+    # First commit
+    res1 = whatsapp.commit_send_message(authorization_code=auth_code)
+    assert res1["success"] is True
+    assert res1["status"] == "sent"
+    assert res1["message_sent"] is True
+    assert res1["read_marked"] is False
+    assert send_calls == 1
+
+    # Second commit attempt with same code: must NOT call /send again
+    res2 = whatsapp.commit_send_message(authorization_code=auth_code)
+    assert res2["success"] is True
+    assert res2["status"] == "sent"
+    assert res2.get("already_sent") is True
+    assert send_calls == 1  # Verified: /send was NOT called a second time!

@@ -1498,13 +1498,25 @@ def mark_chat_read(
                         message_id=message_id_clean or data.get("marked_read_through_message_id"),
                         last_error=data.get("app_state_error", "App state remote sync pending"),
                     )
-                    data["queue_id"] = enqueue_res.get("queue_id")
+                    queue_id = enqueue_res if isinstance(enqueue_res, int) else (enqueue_res.get("queue_id") if isinstance(enqueue_res, dict) else None)
+                    data["queue_id"] = queue_id
                 except Exception as q_err:
                     print(f"Warning: failed to enqueue pending read mark: {q_err}")
             return data
 
         chat = get_chat(chat_jid_clean, include_last_message=True)
         current_unread = chat.get("unread", True) if isinstance(chat, dict) else True
+
+        # If bridge returns an error (>=500), enqueue in persistent retry queue for background recovery
+        if response.status_code >= 500:
+            try:
+                enqueue_pending_read_mark(
+                    chat_jid_clean,
+                    message_id=message_id_clean,
+                    last_error=f"Bridge HTTP {response.status_code}: {response.text[:200]}",
+                )
+            except Exception as q_err:
+                print(f"Warning: failed to enqueue pending read mark: {q_err}")
 
         try:
             err_data = response.json()
@@ -1527,6 +1539,14 @@ def mark_chat_read(
     except requests.RequestException as e:
         chat = get_chat(chat_jid_clean, include_last_message=True)
         current_unread = chat.get("unread", True) if isinstance(chat, dict) else True
+        try:
+            enqueue_pending_read_mark(
+                chat_jid_clean,
+                message_id=message_id_clean,
+                last_error=f"WhatsApp bridge unreachable: {e}",
+            )
+        except Exception as q_err:
+            print(f"Warning: failed to enqueue pending read mark: {q_err}")
         return {
             "success": False,
             "status": "unavailable",
@@ -1689,7 +1709,12 @@ def process_pending_read_marks(
         for item_id, chat_jid, message_id, retry_count, max_retries in items:
             processed += 1
             read_res = mark_chat_read(chat_jid, message_id=message_id)
-            if read_res.get("success"):
+            is_completed = (
+                read_res.get("success", False)
+                and read_res.get("remote_synced", True) is not False
+                and read_res.get("status") != "pending_queued"
+            )
+            if is_completed:
                 succeeded += 1
                 cursor.execute(
                     """
@@ -1701,7 +1726,7 @@ def process_pending_read_marks(
                 )
             else:
                 new_retry = retry_count + 1
-                err_msg = read_res.get("error", "Unknown error")
+                err_msg = read_res.get("app_state_error") or read_res.get("error") or "Remote sync pending"
                 if new_retry >= max_retries:
                     failed += 1
                     cursor.execute(
@@ -1759,6 +1784,27 @@ def get_read_queue_status(
 
         cursor.execute(
             """
+            SELECT created_at
+            FROM pending_read_marks
+            WHERE status = 'pending'
+            ORDER BY id ASC
+            LIMIT 1
+            """
+        )
+        oldest_row = cursor.fetchone()
+        oldest_pending_created_at = oldest_row[0] if oldest_row else None
+        oldest_pending_age_seconds = None
+        if oldest_pending_created_at:
+            try:
+                oldest_dt = datetime.fromisoformat(oldest_pending_created_at)
+                if oldest_dt.tzinfo is None:
+                    oldest_dt = oldest_dt.replace(tzinfo=UTC)
+                oldest_pending_age_seconds = max(0.0, (datetime.now(UTC) - oldest_dt).total_seconds())
+            except Exception:
+                pass
+
+        cursor.execute(
+            """
             SELECT id, chat_jid, message_id, retry_count, max_retries, status, last_error, created_at, updated_at, next_retry_at, completed_at
             FROM pending_read_marks
             ORDER BY id DESC
@@ -1788,6 +1834,8 @@ def get_read_queue_status(
             "completed_count": completed_count,
             "failed_count": failed_count,
             "total_count": total_count,
+            "oldest_pending_created_at": oldest_pending_created_at,
+            "oldest_pending_age_seconds": oldest_pending_age_seconds,
             "items": items,
         }
     finally:
@@ -3159,6 +3207,8 @@ def commit_send_message(
                 return False, "disabled", "WHATSAPP_MARK_READ_ENABLED=false"
             read_res = mark_chat_read(chat_jid, message_id=pre_send_inbound_id)
             if read_res.get("success"):
+                if read_res.get("status") == "pending_queued" or read_res.get("remote_synced") is False:
+                    return True, "pending_queued", read_res.get("app_state_error")
                 return True, "marked", None
             err_msg = read_res.get("error", "Failed to mark chat read")
             try:
@@ -3230,7 +3280,7 @@ def commit_send_message(
                     "read_marked": read_ok,
                     "read_status": read_status,
                 }
-                if not read_ok and read_err:
+                if read_err:
                     ret["read_error"] = read_err
                 return ret
             else:
@@ -3281,7 +3331,7 @@ def commit_send_message(
                     "read_marked": read_ok,
                     "read_status": read_status,
                 }
-                if not read_ok and read_err:
+                if read_err:
                     ret["read_error"] = read_err
                 return ret
             else:

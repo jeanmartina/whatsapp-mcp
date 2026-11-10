@@ -2633,27 +2633,14 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 			}
 		}
 
-		// Try FetchAppState fullSync first
-		syncErr := client.FetchAppState(r.Context(), collection, true, false)
-		if syncErr == nil {
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"success":    true,
-				"status":     "snapshot_resynced",
-				"collection": collection,
-			})
-			return
-		}
-
-		// If server snapshot fails with LTHash mismatch, dispatch peer recovery request
-		req := whatsmeow.BuildAppStateRecoveryRequest(collection)
-		resp, peerErr := client.SendPeerMessage(r.Context(), req)
-		if peerErr != nil {
+		// Try server fullSync first, then peer recovery if needed, serialized with mutex
+		recErr := globalAppStateManager.RecoverAppState(r.Context(), client, collection)
+		if recErr != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusInternalServerError)
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"success":    false,
-				"error":      fmt.Sprintf("FetchAppState failed: %v; SendPeerMessage failed: %v", syncErr, peerErr),
+				"error":      recErr.Error(),
 				"collection": collection,
 			})
 			return
@@ -2662,10 +2649,8 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"success":    true,
-			"status":     "peer_recovery_requested",
+			"status":     "snapshot_resynced",
 			"collection": collection,
-			"fetch_err":  syncErr.Error(),
-			"timestamp":  resp.Timestamp,
 		})
 	}))
 
@@ -3443,7 +3428,7 @@ func main() {
 				logger.Warnf("Failed to send presence: %v", err)
 			}
 			go func() {
-				// Resync AppState patches (such as labels/chat filters) in background
+				// Resync AppState patches in background with mutex serialization
 				ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 				defer cancel()
 				for _, patch := range []appstate.WAPatchName{
@@ -3451,7 +3436,7 @@ func main() {
 					appstate.WAPatchRegularLow,
 					appstate.WAPatchRegularHigh,
 				} {
-					if err := client.FetchAppState(ctx, patch, false, false); err != nil {
+					if err := globalAppStateManager.FetchAppStateWithLock(ctx, client, patch, false, false); err != nil {
 						logger.Warnf("Failed to fetch %s app state: %v", patch, err)
 					} else {
 						logger.Infof("✓ %s app state sync complete", patch)
