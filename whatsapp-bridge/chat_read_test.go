@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -21,14 +22,17 @@ import (
 )
 
 type mockReadClient struct {
+	mu                 sync.Mutex
 	connected          bool
 	markReadCalls      []markReadCall
 	appStatePatches    []appstate.PatchInfo
 	fetchAppStateCalls []fetchAppStateCall
+	peerMessages       []*waE2E.Message
 	markReadErr        error
 	appStateErr        error
 	fetchAppStateErr   error
 	appStateErrQueue   []error
+	fetchAppStateFn    func(name appstate.WAPatchName, fullSync, onlyIfNotSynced bool) error
 }
 
 type fetchAppStateCall struct {
@@ -49,6 +53,8 @@ func (m *mockReadClient) IsConnected() bool {
 }
 
 func (m *mockReadClient) MarkRead(ctx context.Context, ids []types.MessageID, timestamp time.Time, chat, sender types.JID, receiptTypeExtra ...types.ReceiptType) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.markReadCalls = append(m.markReadCalls, markReadCall{
 		ids:       ids,
 		timestamp: timestamp,
@@ -59,6 +65,8 @@ func (m *mockReadClient) MarkRead(ctx context.Context, ids []types.MessageID, ti
 }
 
 func (m *mockReadClient) SendAppState(ctx context.Context, patch appstate.PatchInfo) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.appStatePatches = append(m.appStatePatches, patch)
 	if len(m.appStateErrQueue) > 0 {
 		err := m.appStateErrQueue[0]
@@ -69,15 +77,23 @@ func (m *mockReadClient) SendAppState(ctx context.Context, patch appstate.PatchI
 }
 
 func (m *mockReadClient) FetchAppState(ctx context.Context, name appstate.WAPatchName, fullSync, onlyIfNotSynced bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.fetchAppStateCalls = append(m.fetchAppStateCalls, fetchAppStateCall{
 		name:            name,
 		fullSync:        fullSync,
 		onlyIfNotSynced: onlyIfNotSynced,
 	})
+	if m.fetchAppStateFn != nil {
+		return m.fetchAppStateFn(name, fullSync, onlyIfNotSynced)
+	}
 	return m.fetchAppStateErr
 }
 
 func (m *mockReadClient) SendPeerMessage(ctx context.Context, message *waE2E.Message) (whatsmeow.SendResponse, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.peerMessages = append(m.peerMessages, message)
 	return whatsmeow.SendResponse{Timestamp: time.Now()}, nil
 }
 
@@ -596,7 +612,7 @@ func TestSendAppStateWithRecovery_ExhaustedRetries(t *testing.T) {
 	}
 }
 
-func TestMarkChatRead_FailurePreservesUnreadAndDB(t *testing.T) {
+func TestMarkChatRead_AppStateFailureQueuesPending(t *testing.T) {
 	t.Setenv("WHATSAPP_MARK_READ_ENABLED", "true")
 	ms := newTestMessageStore(t)
 	chatJID := "15551234567@s.whatsapp.net"
@@ -622,8 +638,8 @@ func TestMarkChatRead_FailurePreservesUnreadAndDB(t *testing.T) {
 
 	handleMarkChatRead(rec, req, mockCli, nil, ms)
 
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("expected 500, got %d (body: %s)", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK with pending_queued status, got %d (body: %s)", rec.Code, rec.Body.String())
 	}
 
 	var resp MarkChatReadResponse
@@ -631,11 +647,59 @@ func TestMarkChatRead_FailurePreservesUnreadAndDB(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
-	if resp.Success {
-		t.Fatalf("expected success = false on app state error")
+	if !resp.Success {
+		t.Fatalf("expected success = true when receipts were delivered and appstate queued")
 	}
-	if !resp.Unread {
-		t.Fatalf("expected unread = true on failure! Must not report unread=false when sync failed")
+	if resp.RemoteSynced {
+		t.Fatalf("expected remote_synced = false on app state error")
+	}
+	if resp.Status != "pending_queued" {
+		t.Fatalf("expected status = pending_queued, got %s", resp.Status)
+	}
+	if resp.AppStateError == "" {
+		t.Fatalf("expected app_state_error to be populated, got empty")
+	}
+
+	// Verify receipts were sent
+	if len(mockCli.markReadCalls) == 0 {
+		t.Fatalf("expected markReadCalls > 0")
+	}
+
+	// Verify database local read marker was updated to reflect sent receipts
+	lastRead, _, found, err := ms.GetChatReadInfo(chatJID)
+	if err != nil || !found {
+		t.Fatalf("GetChatReadInfo error: %v", err)
+	}
+	if lastRead == nil {
+		t.Fatalf("expected lastRead to be set in database, got nil")
+	}
+}
+
+func TestMarkChatRead_DisconnectedClientFailsWithoutUpdatingDB(t *testing.T) {
+	t.Setenv("WHATSAPP_MARK_READ_ENABLED", "true")
+	ms := newTestMessageStore(t)
+	chatJID := "15551234567@s.whatsapp.net"
+	t1 := time.Date(2026, 10, 7, 10, 0, 0, 0, time.UTC)
+
+	if err := ms.StoreChat(chatJID, "Alice", t1); err != nil {
+		t.Fatalf("StoreChat: %v", err)
+	}
+	if err := ms.StoreMessage("msg1", chatJID, "15551234567", "hello", t1, false, "", "", "", nil, nil, nil, 0, ""); err != nil {
+		t.Fatalf("StoreMessage: %v", err)
+	}
+
+	mockCli := &mockReadClient{
+		connected: false,
+	}
+
+	body := `{"chat_jid":"` + chatJID + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/chats/mark-read", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	handleMarkChatRead(rec, req, mockCli, nil, ms)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d", rec.Code)
 	}
 
 	// Verify database was NOT updated
@@ -644,7 +708,189 @@ func TestMarkChatRead_FailurePreservesUnreadAndDB(t *testing.T) {
 		t.Fatalf("GetChatReadInfo error: %v", err)
 	}
 	if lastRead != nil {
-		t.Fatalf("expected lastRead to remain nil in database, got %v", lastRead)
+		t.Fatalf("expected lastRead to remain nil when disconnected, got %v", lastRead)
+	}
+}
+
+func TestSendAppStateWithRecovery_TieredLTHashRecovery(t *testing.T) {
+	mgr := NewAppStateManager()
+	patch := appstate.BuildMarkChatAsRead(types.NewJID("15551234567", types.DefaultUserServer), true, time.Now(), nil)
+
+	conflictErr := errors.New("server returned error updating app state (regular_low): <error code=\"409\" text=\"conflict\"/> (also, applying patches in the response failed: failed to decode app state regular_low patches: failed to verify patch v270: mismatching LTHash)")
+
+	mockCli := &mockReadClient{
+		connected:        true,
+		appStateErrQueue: []error{conflictErr, nil},
+		fetchAppStateFn: func(name appstate.WAPatchName, fullSync, onlyIfNotSynced bool) error {
+			if !fullSync {
+				// Tier 1 incremental sync fails due to corrupt local LTHash
+				return errors.New("failed to verify patch v270: mismatching LTHash")
+			}
+			// Tier 2 full snapshot sync succeeds
+			return nil
+		},
+	}
+
+	err := mgr.SendAppStateWithRecovery(context.Background(), mockCli, patch)
+	if err != nil {
+		t.Fatalf("expected SendAppStateWithRecovery to succeed on Tier 2 fullSync, got %v", err)
+	}
+
+	mockCli.mu.Lock()
+	calls := append([]fetchAppStateCall(nil), mockCli.fetchAppStateCalls...)
+	mockCli.mu.Unlock()
+
+	if len(calls) != 2 {
+		t.Fatalf("expected 2 FetchAppState calls (Tier 1 incremental then Tier 2 fullSync), got %d", len(calls))
+	}
+	if calls[0].fullSync != false {
+		t.Fatalf("expected call 0 to be incremental (fullSync=false)")
+	}
+	if calls[1].fullSync != true {
+		t.Fatalf("expected call 1 to be full snapshot (fullSync=true)")
+	}
+
+	diag := mgr.GetDiagnostics(context.Background(), mockCli)
+	if diag.ConflictsDetected != 1 {
+		t.Fatalf("expected 1 conflict detected, got %d", diag.ConflictsDetected)
+	}
+	if diag.IncrementalRecoveriesAttempted != 1 {
+		t.Fatalf("expected 1 incremental recovery attempted, got %d", diag.IncrementalRecoveriesAttempted)
+	}
+	if diag.FullSyncRecoveriesAttempted != 1 {
+		t.Fatalf("expected 1 full sync recovery attempted, got %d", diag.FullSyncRecoveriesAttempted)
+	}
+	if diag.RecoveriesSucceeded != 1 {
+		t.Fatalf("expected 1 recovery succeeded, got %d", diag.RecoveriesSucceeded)
+	}
+}
+
+func TestSendAppStateWithRecovery_TieredPeerRecovery(t *testing.T) {
+	mgr := NewAppStateManager()
+	patch := appstate.BuildMarkChatAsRead(types.NewJID("15551234567", types.DefaultUserServer), true, time.Now(), nil)
+
+	conflictErr := errors.New("server returned error updating app state (regular_low): 409 conflict")
+
+	callCount := 0
+	mockCli := &mockReadClient{
+		connected:        true,
+		appStateErrQueue: []error{conflictErr, nil},
+		fetchAppStateFn: func(name appstate.WAPatchName, fullSync, onlyIfNotSynced bool) error {
+			callCount++
+			if callCount == 1 {
+				// Tier 1 incremental fails
+				return errors.New("mismatching LTHash")
+			}
+			if callCount == 2 {
+				// Tier 2 server snapshot fails
+				return errors.New("server snapshot 500")
+			}
+			// Tier 3 full sync after peer recovery request succeeds
+			return nil
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := mgr.SendAppStateWithRecovery(ctx, mockCli, patch)
+	if err != nil {
+		t.Fatalf("expected SendAppStateWithRecovery to succeed after Tier 3 peer recovery, got %v", err)
+	}
+
+	mockCli.mu.Lock()
+	peerCalls := len(mockCli.peerMessages)
+	mockCli.mu.Unlock()
+
+	if peerCalls != 1 {
+		t.Fatalf("expected 1 peer message dispatch, got %d", peerCalls)
+	}
+
+	diag := mgr.GetDiagnostics(context.Background(), mockCli)
+	if diag.PeerRecoveriesAttempted != 1 {
+		t.Fatalf("expected 1 peer recovery attempted, got %d", diag.PeerRecoveriesAttempted)
+	}
+	if diag.RecoveriesSucceeded != 1 {
+		t.Fatalf("expected 1 recovery succeeded, got %d", diag.RecoveriesSucceeded)
+	}
+}
+
+func TestFetchAppStateWithLock_Coordination(t *testing.T) {
+	mgr := NewAppStateManager()
+	mockCli := &mockReadClient{connected: true}
+
+	var executionOrder []string
+	var mu sync.Mutex
+
+	mockCli.fetchAppStateFn = func(name appstate.WAPatchName, fullSync, onlyIfNotSynced bool) error {
+		mu.Lock()
+		executionOrder = append(executionOrder, "fetch")
+		mu.Unlock()
+		time.Sleep(30 * time.Millisecond)
+		return nil
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		_ = mgr.FetchAppStateWithLock(context.Background(), mockCli, appstate.WAPatchRegularLow, false, false)
+	}()
+
+	go func() {
+		defer wg.Done()
+		time.Sleep(5 * time.Millisecond)
+		patch := appstate.BuildMarkChatAsRead(types.NewJID("15551234567", types.DefaultUserServer), true, time.Now(), nil)
+		_ = mgr.SendAppStateWithRecovery(context.Background(), mockCli, patch)
+		mu.Lock()
+		executionOrder = append(executionOrder, "send")
+		mu.Unlock()
+	}()
+
+	wg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(executionOrder) != 2 {
+		t.Fatalf("expected 2 operations recorded, got %d", len(executionOrder))
+	}
+}
+
+func TestSendAppStateWithRecovery_SixConcurrentSends(t *testing.T) {
+	mgr := NewAppStateManager()
+	mockCli := &mockReadClient{connected: true}
+
+	const numChats = 6
+	var wg sync.WaitGroup
+	errCh := make(chan error, numChats)
+
+	for i := 0; i < numChats; i++ {
+		wg.Add(1)
+		chatPhone := fmt.Sprintf("1555000000%d", i)
+		go func(phone string) {
+			defer wg.Done()
+			jid := types.NewJID(phone, types.DefaultUserServer)
+			patch := appstate.BuildMarkChatAsRead(jid, true, time.Now(), nil)
+			if err := mgr.SendAppStateWithRecovery(context.Background(), mockCli, patch); err != nil {
+				errCh <- fmt.Errorf("chat %s: %w", phone, err)
+			}
+		}(chatPhone)
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		t.Fatalf("unexpected error during 6 concurrent sends: %v", err)
+	}
+
+	mockCli.mu.Lock()
+	totalPatches := len(mockCli.appStatePatches)
+	mockCli.mu.Unlock()
+
+	if totalPatches != numChats {
+		t.Fatalf("expected %d total patches sent, got %d", numChats, totalPatches)
 	}
 }
 

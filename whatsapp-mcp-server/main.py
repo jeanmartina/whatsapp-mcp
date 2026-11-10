@@ -1,7 +1,9 @@
+import asyncio
 import os
 import signal
 import sys
 import tempfile
+import threading
 from typing import Annotated, Any
 
 from mcp.server.fastmcp import FastMCP, Image
@@ -1018,8 +1020,31 @@ def create_asgi_app(mount_path: str = "", auth_token: str | None = None) -> Any:
         if getattr(mcp.session_manager, "_has_started", False):
             mcp._session_manager = None
             mcp.streamable_http_app()
-        async with mcp.session_manager.run():
-            yield
+
+        worker_stop = asyncio.Event()
+
+        async def _background_queue_worker():
+            # Initial brief delay before starting periodic pending read mark drain
+            await asyncio.sleep(5)
+            while not worker_stop.is_set():
+                try:
+                    await asyncio.to_thread(whatsapp_process_pending_read_marks, max_items=10)
+                except Exception as exc:
+                    print(f"[QueueWorker] Error processing pending read marks: {exc}", file=sys.stderr)
+                try:
+                    await asyncio.wait_for(worker_stop.wait(), timeout=60.0)
+                except asyncio.TimeoutError:
+                    pass
+
+        worker_task = asyncio.create_task(_background_queue_worker())
+        try:
+            async with mcp.session_manager.run():
+                yield
+        finally:
+            worker_stop.set()
+            worker_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await worker_task
 
     app = Starlette(
         routes=routes,
@@ -1114,7 +1139,21 @@ if __name__ == "__main__":
 
     if transport == "stdio":
         install_stdio_parent_watchdog("WHATSAPP_PARENT_WATCHDOG_S", parent_pid=parent_pid)
-        mcp.run(transport=transport)
+        stop_worker = threading.Event()
+
+        def _stdio_queue_worker():
+            while not stop_worker.wait(60.0):
+                try:
+                    whatsapp_process_pending_read_marks(max_items=10)
+                except Exception as exc:
+                    print(f"[QueueWorker] Error processing pending read marks: {exc}", file=sys.stderr)
+
+        t = threading.Thread(target=_stdio_queue_worker, daemon=True, name="PendingReadMarksWorker")
+        t.start()
+        try:
+            mcp.run(transport=transport)
+        finally:
+            stop_worker.set()
     else:
         import uvicorn
         from urllib.parse import urlparse
